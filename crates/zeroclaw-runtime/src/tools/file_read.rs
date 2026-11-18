@@ -500,15 +500,14 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_blocks_absolute_path() {
-        let tool = test_tool(std::env::temp_dir());
-
-        #[cfg(unix)]
-        let target = "/etc/passwd";
-        #[cfg(windows)]
-        let target = {
-            let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-            std::path::PathBuf::from(sysroot).join(r"System32\drivers\etc\hosts")
-        };
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        let target = fixture.path().join("outside.txt");
+        tokio::fs::write(&target, "outside the workspace")
+            .await
+            .unwrap();
+        let tool = test_tool(workspace);
 
         let result = tool.execute(json!({"path": target})).await.unwrap();
         assert!(!result.success);

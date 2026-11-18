@@ -27,6 +27,14 @@ pub trait Sandbox: Send + Sync {
         Ok(())
     }
 
+    /// Probe subprocess launch readiness separately from constructor validity.
+    /// This is an on-demand check in the caller's process context, not cached
+    /// health of another process or permission to bypass a failed wrapper.
+    /// Backends without a launch probe retain initialization-only validation.
+    fn check_launch(&self) -> std::io::Result<()> {
+        self.check_initialization()
+    }
+
     fn is_available(&self) -> bool;
 
     /// Return the human-readable name of this sandbox backend.

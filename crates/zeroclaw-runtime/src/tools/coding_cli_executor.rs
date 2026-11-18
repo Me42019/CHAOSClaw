@@ -68,6 +68,8 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
                 .map_err(CodingCliExecutionError::Prepare)?
         };
 
+        // Replacing wrappers need the validated namespace working directory.
+        process.current_dir(&command.working_dir);
         self.sandbox
             .wrap_command(process.as_std_mut())
             .map_err(|error| CodingCliExecutionError::Prepare(error.into()))?;
@@ -134,6 +136,39 @@ mod tests {
         zeroclaw_config::autonomy::AutonomyLevel, zeroclaw_config::schema::CodexCliConfig,
         zeroclaw_tools::codex_cli::CodexCliTool,
     };
+
+    #[cfg(all(feature = "sandbox-bubblewrap", target_os = "linux"))]
+    #[tokio::test]
+    #[ignore = "requires a working Linux Bubblewrap installation"]
+    async fn bubblewrap_real_coding_executor_preserves_subdirectory_and_safe_environment() {
+        let ws = tempfile::tempdir().unwrap();
+        let subdir = ws.path().join("project");
+        std::fs::create_dir(&subdir).unwrap();
+        let sandbox = crate::security::bubblewrap::BubblewrapSandbox::with_roots(
+            Some(ws.path()),
+            &crate::security::detect::SandboxExtraRoots::default(),
+        )
+        .unwrap();
+        let executor = RuntimeCodingCliExecutor::shared(
+            Arc::new(crate::platform::NativeRuntime::new()),
+            Arc::new(sandbox),
+            true,
+        );
+        let mut command = CodingCliCommand::new("/usr/bin/sh", subdir.clone(), 30);
+        command.args(["-c", "pwd; printf '%s|%s|%s' \"$CODING_SENTINEL\" \"$HOME\" \"$TMPDIR\"; test -d /proc && test -z \"$(ls -A /proc)\" && printf 'PROCFS_ABSENT'"]);
+        command.env("CODING_SENTINEL", "safe-selected-value");
+        let output = executor.output(command).await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with(subdir.to_str().unwrap()));
+        assert!(stdout.contains("safe-selected-value|/tmp/home|/tmp"));
+        assert!(stdout.contains("PROCFS_ABSENT"));
+        println!("{stdout}");
+    }
 
     #[test]
     fn shell_command_uses_posix_quoting_for_shell_runtimes() {
