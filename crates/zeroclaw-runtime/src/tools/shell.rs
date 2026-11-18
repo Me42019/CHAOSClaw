@@ -635,6 +635,79 @@ mod tests {
     use zeroclaw_config::schema::DockerRuntimeConfig;
     use zeroclaw_tools::wrappers::RateLimitedTool;
 
+    #[cfg(all(feature = "sandbox-bubblewrap", target_os = "linux"))]
+    #[tokio::test]
+    #[ignore = "requires a working Linux Bubblewrap installation"]
+    async fn bubblewrap_real_shell_enforces_policy_and_private_tmp() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ws = fixture.path().join("kat");
+        let ro = fixture.path().join("reference");
+        let rw = fixture.path().join("authorized");
+        let other = fixture.path().join("dirk");
+        for p in [&ws, &ro, &rw, &other] {
+            std::fs::create_dir(p).unwrap();
+        }
+        std::fs::write(ro.join("canary"), "reference").unwrap();
+        std::fs::write(other.join("canary"), "protected").unwrap();
+        let host_tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host_tmp.path(), "protected-temp").unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![rw.clone()],
+            allowed_roots_read_only: vec![ro.clone()],
+            allowed_commands: vec!["sh".into()],
+            block_high_risk_commands: false,
+            require_approval_for_medium_risk: false,
+            autonomy: AutonomyLevel::Full,
+            ..Default::default()
+        });
+        let sandbox = crate::security::detect::create_sandbox(
+            &zeroclaw_config::schema::SandboxConfig {
+                enabled: Some(true),
+                backend: zeroclaw_config::schema::SandboxBackend::Bubblewrap,
+                ..Default::default()
+            },
+            zeroclaw_config::schema::RuntimeKind::Native,
+            Some(&ws),
+            &crate::security::detect::SandboxExtraRoots {
+                read_write: vec![rw.clone()],
+                read_only: vec![ro.clone()],
+                write_only: vec![],
+            },
+        );
+        sandbox.check_initialization().unwrap();
+        let tool = ShellTool::new_with_sandbox(security, test_runtime(), sandbox);
+        let script = format!(
+            "sh -c 'test \"$HOME\" = /tmp/home && test \"$TMPDIR\" = /tmp && test \"$(pwd)\" = {} && cat {}/canary && echo written > {}/new && ! cat {}/canary && ! echo bad > {}/canary && ! cat {} && echo private > {} && test -d /proc && test -z \"$(ls -A /proc)\" && ! cat /proc/self/status'",
+            ws.display(),
+            ro.display(),
+            rw.display(),
+            other.display(),
+            ro.display(),
+            host_tmp.path().display(),
+            host_tmp.path().display()
+        );
+        let result = tool.execute(json!({"command": script})).await.unwrap();
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(ro.join("canary")).unwrap(),
+            "reference"
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.join("canary")).unwrap(),
+            "protected"
+        );
+        assert_eq!(
+            std::fs::read_to_string(host_tmp.path()).unwrap(),
+            "protected-temp"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rw.join("new")).unwrap(),
+            "written\n"
+        );
+        println!("{}", result.output);
+    }
+
     #[tokio::test]
     async fn get_session_id_returns_scoped_session_key() {
         let got = crate::agent::loop_::scope_session_key(Some("gw_abc-123".to_string()), async {

@@ -963,6 +963,7 @@ cli-security-status-risk-profile = Risk profile: {$v}
 cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
+cli-security-status-sandbox-description-bubblewrap-launch-checked = Bubblewrap workspace launch probe passed in this process context; other processes and prior launches are not assessed
 cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
 cli-security-status-sandbox-description-firejail-args-rejected = Firejail selected, but firejail_args were rejected; commands are blocked ({$reason})
 cli-security-firejail-args-error-empty = firejail_args rejected: an entry is empty

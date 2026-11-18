@@ -8,8 +8,7 @@ use zeroclaw_config::schema::{RuntimeKind, SandboxBackend, SandboxConfig};
 /// Extra filesystem roots beyond the primary workspace that a sandbox should
 /// also grant access to, mirroring `SecurityPolicy`'s allowed-roots tiers
 /// (`allowed_roots`, `allowed_roots_read_only`, `allowed_roots_write_only`).
-/// Backends that build per-path rulesets (Landlock and macOS Seatbelt)
-/// consume this; others ignore it.
+/// Path-aware backends (Landlock, Bubblewrap and macOS Seatbelt) consume this.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxExtraRoots {
     pub read_write: Vec<PathBuf>,
@@ -44,6 +43,11 @@ pub struct SandboxPosture {
 /// report a backend as active while every subsequent spawn failed; validating
 /// through the real construction keeps the two answers in step.
 ///
+/// Explicit Bubblewrap also launches a bounded no-op with its actual workspace
+/// mount plan. This reports launchability in the calling process context, not
+/// the health or history of another process (such as a separate Gateway).
+/// Constructor validation and actual launch failure both return `blocked`.
+///
 /// The ruleset is dropped without `restrict_self`, so the calling process is
 /// never confined.
 #[must_use]
@@ -57,6 +61,30 @@ pub fn sandbox_posture(
     if matches!(sandbox.backend, SandboxBackend::None) || sandbox.enabled == Some(false) {
         let active = runtime_fallback_backend(runtime_kind);
         return sandbox_posture_result(requested_backend, active.name(), active.description());
+    }
+
+    if matches!(sandbox.backend, SandboxBackend::Bubblewrap) {
+        let selected = create_sandbox(sandbox, runtime_kind, workspace_dir, extra_roots);
+        return match selected
+            .check_initialization()
+            .and_then(|()| selected.check_launch())
+        {
+            Ok(()) => sandbox_posture_result(
+                requested_backend,
+                "bubblewrap",
+                crate::i18n::get_required_cli_string(
+                    "cli-security-status-sandbox-description-bubblewrap-launch-checked",
+                ),
+            ),
+            Err(error) => SandboxPosture {
+                requested_backend,
+                active_backend: "blocked",
+                active_description: error.to_string(),
+                // No fallback: the real wrapper must establish isolation before
+                // executing a payload, even when construction was valid.
+                fallback: false,
+            },
+        };
     }
 
     let (active_backend, _) =
@@ -430,6 +458,21 @@ pub fn create_sandbox(
             &sandbox.image,
             &sandbox.firejail_args,
         ),
+        SandboxBackend::Bubblewrap => create_selected_sandbox(
+            SelectedSandboxBackend::Bubblewrap,
+            workspace_dir,
+            extra_roots,
+            &sandbox.image,
+            &sandbox.firejail_args,
+        )
+        .unwrap_or_else(|| {
+            Arc::new(FailedBubblewrapSandbox {
+                error: std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Bubblewrap is not compiled for this platform/build",
+                ),
+            })
+        }),
         requested => {
             let (selected, unavailable_reason) =
                 configured_backend_selection(requested, runtime_kind, workspace_dir, extra_roots);
@@ -482,6 +525,34 @@ fn detect_best_sandbox(
 
     log_auto_backend_selection(SelectedSandboxBackend::None, runtime_kind);
     Arc::new(super::traits::NoopSandbox)
+}
+
+struct FailedBubblewrapSandbox {
+    error: std::io::Error,
+}
+
+impl Sandbox for FailedBubblewrapSandbox {
+    fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+        self.check_initialization()
+    }
+    fn check_initialization(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            self.error.kind(),
+            format!(
+                "Bubblewrap initialization failed; commands are blocked: {}",
+                self.error
+            ),
+        ))
+    }
+    fn is_available(&self) -> bool {
+        false
+    }
+    fn name(&self) -> &str {
+        "bubblewrap"
+    }
+    fn description(&self) -> &str {
+        "Bubblewrap initialization failed; commands are blocked"
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -621,9 +692,15 @@ fn create_selected_sandbox(
                 any(target_os = "linux", target_os = "macos")
             ))]
             {
-                super::bubblewrap::BubblewrapSandbox::new()
-                    .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
-                    .ok()
+                Some(
+                    match super::bubblewrap::BubblewrapSandbox::with_roots(
+                        workspace_dir,
+                        extra_roots,
+                    ) {
+                        Ok(sandbox) => Arc::new(sandbox) as Arc<dyn Sandbox>,
+                        Err(error) => Arc::new(FailedBubblewrapSandbox { error }),
+                    },
+                )
             }
             #[cfg(not(all(
                 feature = "sandbox-bubblewrap",
@@ -1005,6 +1082,127 @@ mod tests {
             None,
             "firejail_args only matter when Firejail is the active backend"
         );
+    }
+
+    #[test]
+    fn explicit_bubblewrap_invalid_policy_blocks_instead_of_falling_back() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = SandboxConfig {
+            enabled: Some(true),
+            backend: SandboxBackend::Bubblewrap,
+            ..Default::default()
+        };
+        let sandbox = create_sandbox(
+            &config,
+            RuntimeKind::Native,
+            Some(fixture.path()),
+            &SandboxExtraRoots {
+                write_only: vec![fixture.path().into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(sandbox.name(), "bubblewrap");
+        assert!(sandbox.check_initialization().is_err());
+        assert!(!sandbox.is_available());
+        let mut command = std::process::Command::new("/bin/echo");
+        assert!(sandbox.wrap_command(&mut command).is_err());
+        assert_eq!(command.get_program(), "/bin/echo");
+        let posture = sandbox_posture(
+            &config,
+            RuntimeKind::Native,
+            Some(fixture.path()),
+            &SandboxExtraRoots {
+                write_only: vec![fixture.path().into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(posture.requested_backend, "bubblewrap");
+        assert_eq!(posture.active_backend, "blocked");
+        assert_eq!(
+            posture.active_description,
+            sandbox.check_initialization().unwrap_err().to_string()
+        );
+        assert!(posture.active_description.contains("commands are blocked"));
+        assert!(!posture.fallback);
+        // Reporting must not turn the failed handle into a usable command.
+        assert!(sandbox.wrap_command(&mut command).is_err());
+    }
+
+    #[cfg(all(feature = "sandbox-bubblewrap", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires installed Bubblewrap; run explicitly for backend acceptance"]
+    fn explicit_bubblewrap_initialized_posture_matches_effective_backend() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = SandboxConfig {
+            enabled: Some(true),
+            backend: SandboxBackend::Bubblewrap,
+            ..Default::default()
+        };
+        let roots = SandboxExtraRoots::default();
+        let sandbox = create_sandbox(&config, RuntimeKind::Native, Some(fixture.path()), &roots);
+        sandbox.check_initialization().unwrap();
+        sandbox.check_launch().unwrap();
+        assert!(sandbox.is_available());
+        let mut command = std::process::Command::new("/bin/echo");
+        sandbox.wrap_command(&mut command).unwrap();
+        assert!(command.get_program().to_string_lossy().ends_with("bwrap"));
+        let posture = sandbox_posture(&config, RuntimeKind::Native, Some(fixture.path()), &roots);
+        assert_eq!(posture.requested_backend, "bubblewrap");
+        assert_eq!(posture.active_backend, sandbox.name());
+        assert_eq!(
+            posture.active_description,
+            crate::i18n::get_required_cli_string(
+                "cli-security-status-sandbox-description-bubblewrap-launch-checked",
+            )
+        );
+        assert!(!posture.fallback);
+    }
+
+    #[cfg(all(feature = "sandbox-bubblewrap", target_os = "linux"))]
+    #[test]
+    #[ignore = "run explicitly inside a systemd service with RestrictNamespaces=yes"]
+    fn explicit_bubblewrap_namespace_restriction_blocks_payload_and_posture() {
+        // Real namespace denial after version/constructor success must still
+        // block commands and status, without disabling non-shell tools.
+        super::super::bubblewrap::BubblewrapSandbox::new().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let marker = fixture.path().join("payload-must-not-run");
+        let config = SandboxConfig {
+            enabled: Some(true),
+            backend: SandboxBackend::Bubblewrap,
+            ..Default::default()
+        };
+        let roots = SandboxExtraRoots::default();
+        let sandbox = create_sandbox(&config, RuntimeKind::Native, Some(fixture.path()), &roots);
+        // Valid construction permits delegation/in-process tools to remain
+        // usable. Only subprocess readiness fails under this hardening.
+        sandbox.check_initialization().unwrap();
+        let error = sandbox.check_launch().unwrap_err().to_string();
+        assert!(error.contains("Bubblewrap launch probe failed"), "{error}");
+        assert!(error.contains("namespace"), "{error}");
+        let mut payload = std::process::Command::new("/usr/bin/touch");
+        payload.arg(&marker);
+        sandbox.wrap_command(&mut payload).unwrap();
+        assert!(payload.get_program().to_string_lossy().ends_with("bwrap"));
+        assert!(!payload.output().unwrap().status.success());
+        assert!(!marker.exists());
+        let posture = sandbox_posture(&config, RuntimeKind::Native, Some(fixture.path()), &roots);
+        assert_eq!(posture.requested_backend, "bubblewrap");
+        assert_eq!(posture.active_backend, "blocked");
+        assert!(
+            posture
+                .active_description
+                .contains("Bubblewrap launch probe failed")
+        );
+        assert!(posture.active_description.contains("namespace"));
+        assert!(!posture.fallback);
+        let mut payload = std::process::Command::new("/usr/bin/touch");
+        payload.arg(&marker);
+        sandbox.wrap_command(&mut payload).unwrap();
+        assert!(payload.get_program().to_string_lossy().ends_with("bwrap"));
+        assert!(!payload.output().unwrap().status.success());
+        assert!(!marker.exists());
+        sandbox.check_initialization().unwrap();
     }
 
     #[test]
