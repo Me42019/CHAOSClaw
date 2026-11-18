@@ -2,7 +2,7 @@
 //! that fit the token budget, drop the rest, never cut a turn in half.
 
 use crate::agent::history::estimate_history_tokens;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::ChatMessage;
 
@@ -502,6 +502,49 @@ fn count_tool_calls(rows: &[ChatMessage], known_tools: &HashSet<String>) -> usiz
         .max(1)
 }
 
+/// A native tool batch is safe to remove from model-facing history only when
+/// every dispatched call has exactly one persisted result. Interrupted or
+/// malformed batches stay verbatim in the projection so a resumed turn cannot
+/// lose a pending call or make it appear safe to dispatch again.
+fn native_tool_batch_is_complete(rows: &[ChatMessage], known_tools: &HashSet<String>) -> bool {
+    let call_ids: Vec<String> = rows
+        .iter()
+        .filter(|message| is_tool_call_carrier(message, known_tools))
+        .filter_map(|message| {
+            crate::agent::history_pruner::extract_assistant_tool_call_ids(&message.content)
+        })
+        .flatten()
+        .collect();
+    let result_rows: Vec<&ChatMessage> = rows
+        .iter()
+        .filter(|message| message.role == "tool")
+        .collect();
+    if call_ids.is_empty() {
+        return result_rows.is_empty();
+    }
+
+    let mut unique_calls = HashSet::with_capacity(call_ids.len());
+    if !call_ids.iter().all(|id| unique_calls.insert(id.as_str())) {
+        return false;
+    }
+
+    let mut unique_results = HashSet::with_capacity(result_rows.len());
+    for result in result_rows {
+        let Some(id) = serde_json::from_str::<serde_json::Value>(&result.content)
+            .ok()
+            .and_then(|value| value.get("tool_call_id")?.as_str().map(str::to_owned))
+        else {
+            return false;
+        };
+        if !unique_results.insert(id) {
+            return false;
+        }
+    }
+
+    unique_calls.len() == unique_results.len()
+        && unique_calls.iter().all(|id| unique_results.contains(*id))
+}
+
 /// Build the provider-facing population in which every turn older than the
 /// newest `keep_prior_turns + 1` turns keeps its user prompt and closing
 /// assistant reply but loses its tool-call and tool-result rows. The running
@@ -543,6 +586,13 @@ pub(crate) fn collapse_tool_context_older_than(
         }
         let span_start = boundary + 1;
         let span_end = boundaries[turn + 1];
+        if !native_tool_batch_is_complete(&history[span_start..span_end], known_tools) {
+            for (row, message) in history.iter().enumerate().take(span_end).skip(span_start) {
+                out.keep(row, message.clone());
+            }
+            cursor = span_end;
+            continue;
+        }
         let closing = (span_end > span_start
             && is_closing_reply(&history[span_end - 1], known_tools))
         .then_some(span_end - 1);
@@ -574,6 +624,144 @@ pub(crate) fn collapse_tool_context_older_than(
         out.keep(row, message.clone());
     }
     out
+}
+
+/// Compact only provider-copy result bodies from successful native exchanges. Keeping
+/// the assistant calls, result IDs and row count intact preserves provider signatures,
+/// exact call arguments and the source mapping used by pre-dispatch trimming.
+pub(crate) fn compact_active_tool_results(
+    messages: &mut [ChatMessage],
+    source_rows: &[usize],
+    observed_outcomes: &HashMap<String, bool>,
+    budget: usize,
+) {
+    const KEEP_RECENT: usize = 3;
+    if budget == 0 || observed_outcomes.len() <= KEEP_RECENT || messages.len() != source_rows.len()
+    {
+        return;
+    }
+    if estimate_history_tokens(messages) as u128 * 10 <= budget as u128 * 7 {
+        return;
+    }
+    let Some(objective) = messages.iter().rposition(opens_retention_turn) else {
+        return;
+    };
+
+    // Count IDs even in partially malformed batches and orphan results. An ID
+    // from a valid pair must occur exactly twice anywhere in the active turn.
+    let mut mentions = HashMap::<String, usize>::new();
+    for message in &messages[objective + 1..] {
+        match message.role.as_str() {
+            "assistant" => {
+                for id in
+                    crate::agent::history_pruner::extract_assistant_tool_call_ids(&message.content)
+                        .into_iter()
+                        .flatten()
+                {
+                    *mentions.entry(id).or_default() += 1;
+                }
+            }
+            "tool" => {
+                if let Some(id) =
+                    crate::agent::history_pruner::extract_tool_call_id(&message.content)
+                {
+                    *mentions.entry(id).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Walk backwards so recent complete exchanges stay raw even if an older
+    // successful batch is preceded or followed by an interrupted round.
+    let mut recent = 0;
+    let mut end = messages.len();
+    while end > objective + 1 {
+        let mut start = end;
+        while start > objective + 1 && messages[start - 1].role == "tool" {
+            start -= 1;
+        }
+        let carrier = start - 1;
+        if start < end && messages[carrier].role == "assistant" {
+            let results = &messages[start..end];
+            if let Some(mut envelopes) = verified_result_envelopes(
+                &messages[carrier].content,
+                results,
+                &mentions,
+                observed_outcomes,
+            ) {
+                recent += 1;
+                if recent > KEEP_RECENT {
+                    for (row, envelope) in (start..end).zip(&mut envelopes) {
+                        let body = envelope["content"].as_str().unwrap_or_default();
+                        // The shared truncator preserves UTF-8, head/tail text and media boundaries.
+                        if body.len() <= 512 {
+                            continue;
+                        }
+                        let excerpt =
+                            crate::agent::history::truncate_tool_result_with_metadata(body, 384);
+                        let summary = format!(
+                            "[Completed tool result, history rows {}..{} (end exclusive), excerpt]\n{}",
+                            source_rows[carrier],
+                            source_rows[end - 1] + 1,
+                            excerpt.output,
+                        );
+                        if summary.len() >= body.len() {
+                            continue;
+                        }
+                        envelope["content"] = serde_json::Value::String(summary);
+                        messages[row].content = envelope.to_string();
+                    }
+                }
+            }
+        }
+        end = carrier;
+    }
+}
+
+fn verified_result_envelopes(
+    assistant: &str,
+    results: &[ChatMessage],
+    mentions: &HashMap<String, usize>,
+    observed_outcomes: &HashMap<String, bool>,
+) -> Option<Vec<serde_json::Value>> {
+    // Only the runtime's own flat, typed native carrier is eligible. Other
+    // layouts, including prompt-mode results, have no equivalent proof here.
+    let carrier: serde_json::Value = serde_json::from_str(assistant).ok()?;
+    let calls = carrier.get("tool_calls")?.as_array()?;
+    if calls.len() != results.len() {
+        return None;
+    }
+    let mut pending = HashSet::new();
+    for call in calls {
+        let id = call.get("id")?.as_str()?;
+        let arguments: serde_json::Value =
+            serde_json::from_str(call.get("arguments")?.as_str()?).ok()?;
+        if id.trim().is_empty()
+            || call.get("name")?.as_str()?.trim().is_empty()
+            || !arguments.is_object()
+            || mentions.get(id) != Some(&2)
+            || observed_outcomes.get(id) != Some(&true)
+            || !pending.insert(id)
+        {
+            return None;
+        }
+    }
+    let mut envelopes = Vec::with_capacity(results.len());
+    for result in results {
+        let envelope: serde_json::Value = serde_json::from_str(&result.content).ok()?;
+        envelope.get("content")?.as_str()?;
+        if !pending.remove(envelope.get("tool_call_id")?.as_str()?) {
+            return None;
+        }
+        if let Some(attachments) = envelope.get("attachments")
+            && !attachments.as_array()?.is_empty()
+        {
+            return None;
+        }
+        envelopes.push(envelope);
+    }
+    Some(envelopes)
 }
 
 /// Drop the oldest whole turn (after leading system messages and an optional
@@ -1873,15 +2061,119 @@ mod collapse_tests {
             .collect()
     }
 
-    fn summary(calls: usize) -> String {
-        ChatMessage::pruned_tool_exchange_summary(calls)
-    }
-
     fn assert_identity(c: &CollapsedToolContext, history: &[ChatMessage]) {
         assert_eq!(rows(&c.messages), rows(history));
         assert_eq!(c.source_rows, (0..history.len()).collect::<Vec<_>>());
         assert_eq!(c.dropped_messages, 0);
         assert_eq!(c.collapsed_turns, 0);
+    }
+
+    fn long_result(id: &str) -> ChatMessage {
+        tool(
+            &serde_json::json!({
+                "tool_call_id": id, "content": format!("{id} {} final status", "観察".repeat(850)),
+                "attachments": [],
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn active_compaction_preserves_source_pairs_and_three_recent_exchanges() {
+        let mut h = native_turn(0);
+        h.push(user("current objective"));
+        let mut observed = HashMap::new();
+        for n in 1..=6 {
+            let id = format!("call_{n}");
+            h.extend([carrier(&[&id]), long_result(&id)]);
+            observed.insert(id, true);
+        }
+        let before = rows(&h);
+        let projection = collapse_tool_context_older_than(&h, 0, false, &known());
+        let estimated = estimate_history_tokens(&projection.messages);
+        let mut messages = projection.messages;
+        let source_rows = projection.source_rows;
+        let threshold_budget = (estimated * 10).div_ceil(7);
+        for budget in [0, threshold_budget] {
+            let mut below = messages.clone();
+            compact_active_tool_results(&mut below, &source_rows, &observed, budget);
+            assert_eq!(rows(&below), rows(&messages));
+        }
+        let budget = threshold_budget - 1;
+        assert!(estimated < budget);
+        compact_active_tool_results(&mut messages, &source_rows, &observed, budget);
+        assert!(estimate_history_tokens(&messages) < budget * 7 / 10);
+        for (message, &row) in messages.iter().zip(&source_rows) {
+            if h[row].role == "tool" && (6..=10).contains(&row) {
+                let value: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+                let id = format!("call_{}", (row - 4) / 2);
+                assert_eq!(value["tool_call_id"], id);
+                let text = value["content"].as_str().unwrap();
+                assert!(text.contains(&format!("rows {}..{}", row - 1, row + 1)));
+                assert!(text.contains(&id) && text.ends_with("final status"));
+                assert!(text.chars().count() < 512);
+            } else {
+                assert_eq!(message.content, h[row].content);
+            }
+        }
+        assert_eq!(rows(&h), before);
+        let mut resumed = h.clone();
+        compact_active_tool_results(
+            &mut resumed,
+            &(0..h.len()).collect::<Vec<_>>(),
+            &HashMap::new(),
+            budget,
+        );
+        assert_eq!(rows(&resumed), before);
+    }
+
+    #[test]
+    fn active_compaction_leaves_ambiguous_failed_and_incomplete_exchanges_raw() {
+        let mut h = vec![
+            user("objective"),
+            carrier(&["missing", "pending"]), long_result("missing"),
+            carrier(&["orphan"]), long_result("unpaired"),
+            carrier(&["twice"]), long_result("twice"), long_result("twice"),
+            carrier(&["repeat_call", "repeat_call"]), long_result("repeat_call"),
+            carrier(&["cross"]), long_result("cross"),
+            asst(r#"{"tool_calls":[{"id":"partial","name":"shell","arguments":"{}"},{}]}"#),
+            long_result("partial"),
+            carrier(&["failed"]), long_result("failed"),
+            carrier(&["cross"]), long_result("cross"),
+            carrier(&["media"]),
+            tool(&serde_json::json!({"tool_call_id":"media","content":"z".repeat(2000),"attachments":[{}]}).to_string()),
+        ];
+        let protected_end = h.len();
+        let mut observed: HashMap<_, _> = [
+            "missing",
+            "orphan",
+            "twice",
+            "repeat_call",
+            "cross",
+            "partial",
+            "media",
+        ]
+        .into_iter()
+        .map(|id| (id.to_owned(), true))
+        .collect();
+        observed.insert("failed".into(), false);
+        for id in ["old", "recent1", "recent2", "recent3"] {
+            h.extend([carrier(&[id]), long_result(id)]);
+            observed.insert(id.into(), true);
+        }
+        h.push(carrier(&["unanswered"]));
+        let mut copy = h.clone();
+        compact_active_tool_results(&mut copy, &(0..h.len()).collect::<Vec<_>>(), &observed, 1);
+        assert_eq!(rows(&copy[..protected_end]), rows(&h[..protected_end]));
+        assert!(
+            copy[protected_end + 1]
+                .content
+                .contains("Completed tool result")
+        );
+        assert_eq!(
+            rows(&copy[protected_end + 2..]),
+            rows(&h[protected_end + 2..])
+        );
     }
 
     #[test]
@@ -1981,7 +2273,7 @@ mod collapse_tests {
     }
 
     #[test]
-    fn aborted_turn_keeps_prompt_and_summary_but_never_a_dangling_carrier() {
+    fn aborted_turn_with_pending_calls_is_preserved_verbatim() {
         let mut h = vec![
             user("request 1"),
             carrier(&["call_1"]),
@@ -1990,13 +2282,36 @@ mod collapse_tests {
         ];
         h.extend(native_turn(2));
         let c = collapse_tool_context_older_than(&h, 0, false, &known());
-        assert_eq!(c.dropped_messages, 3);
-        let mut expected = vec![
-            ("user".to_string(), "request 1".to_string()),
-            ("assistant".to_string(), summary(3)),
-        ];
+        assert_eq!(c.dropped_messages, 0);
+        assert_eq!(c.collapsed_turns, 0);
+        let mut expected = rows(&h[..4]);
         expected.extend(rows(&native_turn(2)));
         assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn only_exactly_paired_native_tool_results_are_compactable() {
+        let complete = vec![
+            user("request 1"),
+            carrier(&["call_1", "call_2"]),
+            tool("{\"tool_call_id\":\"call_1\",\"content\":\"one\"}"),
+            tool("{\"tool_call_id\":\"call_2\",\"content\":\"two\"}"),
+            asst("done"),
+        ];
+        assert!(native_tool_batch_is_complete(&complete[1..4], &known()));
+
+        let missing_result = vec![
+            carrier(&["call_1", "call_2"]),
+            tool("{\"tool_call_id\":\"call_1\",\"content\":\"one\"}"),
+        ];
+        assert!(!native_tool_batch_is_complete(&missing_result, &known()));
+
+        let duplicate_result = vec![
+            carrier(&["call_1"]),
+            tool("{\"tool_call_id\":\"call_1\",\"content\":\"one\"}"),
+            tool("{\"tool_call_id\":\"call_1\",\"content\":\"duplicate\"}"),
+        ];
+        assert!(!native_tool_batch_is_complete(&duplicate_result, &known()));
     }
 
     #[test]
@@ -2062,17 +2377,13 @@ mod collapse_tests {
     }
 
     #[test]
-    fn an_unanswered_call_to_a_known_tool_is_still_summarised() {
-        // The interrupted exchange keeps its protection: the carrier names a
-        // tool the loop executes, so it is a call whose results never came,
-        // not a reply, and the turn keeps only its prompt and the summary.
+    fn an_unanswered_call_to_a_known_tool_is_preserved_verbatim() {
+        // An interrupted exchange is retained whole so resume cannot lose a
+        // pending call or make it appear safe to dispatch again.
         let mut h = vec![user("request 1"), carrier(&["call_1"])];
         h.extend(native_turn(2));
         let c = collapse_tool_context_older_than(&h, 0, false, &known());
-        let mut expected = vec![
-            ("user".to_string(), "request 1".to_string()),
-            ("assistant".to_string(), summary(1)),
-        ];
+        let mut expected = rows(&h[..2]);
         expected.extend(rows(&native_turn(2)));
         assert_eq!(rows(&c.messages), expected);
 

@@ -72,6 +72,7 @@ pub(crate) async fn finish_after_max_iterations(
     injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
+    tool_outcomes: &std::collections::HashMap<String, bool>,
     provider_name: &str,
     model: &str,
     dispatch_model: &str,
@@ -190,14 +191,14 @@ pub(crate) async fn finish_after_max_iterations(
         let summary_future = async {
             // Exclude the synthetic prompt so trailing tool-result images
             // remain in the latest run and receive normal image validation.
-            let mut messages = super::vision_route::prepare_messages_for_iteration(
+            let (prepared, source_rows) = super::vision_route::prepare_messages_with_source_rows(
                 history,
                 multimodal_config,
                 degrade_strip_images,
                 image_cache.as_deref_mut(),
             )
-            .await?
-            .messages;
+            .await?;
+            let mut messages = prepared.messages;
             let prepared_message_count = messages.len();
             messages.push(summary_prompt_mirror.clone());
             let pre_hook_messages = messages.clone();
@@ -226,6 +227,15 @@ pub(crate) async fn finish_after_max_iterations(
             } else {
                 Vec::new()
             };
+            let can_compact = suffix_only && tool_calls_stripped == 0 && tool_messages_removed == 0;
+            if can_compact {
+                crate::agent::history_trim::compact_active_tool_results(
+                    &mut messages[..prepared_message_count],
+                    &source_rows,
+                    tool_outcomes,
+                    context_limits.context_token_budget,
+                );
+            }
             let summary_image_route =
                 super::ProviderImageState::route(provider_name, &selected_model);
             let quarantined_image_ids = provider_image_state
@@ -269,14 +279,23 @@ pub(crate) async fn finish_after_max_iterations(
                         ));
                     }
                     dropped_turns += 1;
-                    messages = super::vision_route::prepare_messages_for_iteration(
-                        history,
-                        multimodal_config,
-                        degrade_strip_images,
-                        image_cache.as_deref_mut(),
-                    )
-                    .await?
-                    .messages;
+                    let (prepared, source_rows) =
+                        super::vision_route::prepare_messages_with_source_rows(
+                            history,
+                            multimodal_config,
+                            degrade_strip_images,
+                            image_cache.as_deref_mut(),
+                        )
+                        .await?;
+                    messages = prepared.messages;
+                    if can_compact {
+                        crate::agent::history_trim::compact_active_tool_results(
+                            &mut messages,
+                            &source_rows,
+                            tool_outcomes,
+                            context_limits.context_token_budget,
+                        );
+                    }
                     messages = super::suppress_quarantined_provider_images(
                         &messages,
                         &quarantined_image_ids,
@@ -674,6 +693,7 @@ mod graceful_summary_metering_tests {
             &mut None,
             provider,
             &mut history,
+            &Default::default(),
             "custom",
             "test-model",
             "test-model",
@@ -1035,6 +1055,7 @@ mod graceful_summary_metering_tests {
                 &mut None,
                 &provider,
                 &mut history,
+                &Default::default(),
                 "custom",
                 "original-model",
                 "hint:original-model",
@@ -1185,6 +1206,7 @@ mod graceful_summary_metering_tests {
                 &mut memory_preamble,
                 &provider,
                 &mut history,
+                &Default::default(),
                 "custom",
                 "original-model",
                 "original-model",
@@ -1260,6 +1282,7 @@ mod graceful_summary_metering_tests {
                 &mut None,
                 &provider,
                 &mut history,
+                &Default::default(),
                 "custom",
                 "test-model",
                 "test-model",
@@ -1356,6 +1379,7 @@ mod graceful_summary_metering_tests {
             &mut None,
             &provider,
             &mut history,
+            &Default::default(),
             "custom",
             "test-model",
             "test-model",
@@ -1440,6 +1464,7 @@ mod graceful_summary_metering_tests {
             &mut None,
             &provider,
             &mut history,
+            &Default::default(),
             "custom",
             "test-model",
             "test-model",
@@ -1539,6 +1564,7 @@ mod graceful_summary_metering_tests {
             &mut None,
             &provider,
             &mut history,
+            &Default::default(),
             "custom",
             "test-model",
             "test-model",
@@ -1621,6 +1647,7 @@ mod graceful_summary_metering_tests {
             &mut None,
             &provider,
             &mut history,
+            &Default::default(),
             "custom",
             "test-model",
             "test-model",
@@ -1713,6 +1740,7 @@ mod graceful_summary_metering_tests {
             &mut None,
             &provider,
             &mut history,
+            &Default::default(),
             "custom",
             "test-model",
             "test-model",
@@ -1768,6 +1796,7 @@ mod graceful_summary_metering_tests {
             &mut None,
             &provider,
             &mut history,
+            &Default::default(),
             "custom",
             "test-model",
             "test-model",
@@ -1855,6 +1884,7 @@ mod graceful_summary_metering_tests {
             &mut None,
             &provider,
             &mut history,
+            &Default::default(),
             "custom",
             "test-model",
             "test-model",
@@ -1945,6 +1975,7 @@ mod graceful_summary_metering_tests {
             &mut None,
             &provider,
             &mut history,
+            &Default::default(),
             "custom",
             "test-model",
             "test-model",

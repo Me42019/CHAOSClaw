@@ -1942,6 +1942,9 @@ async fn run_tool_call_loop_impl<'a>(
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
+    // The durable carrier has no success flag. Only outcomes observed in this
+    // invocation can authorize shortening a result; restored history stays raw.
+    let mut tool_outcomes = std::collections::HashMap::new();
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
         // Re-resolved every iteration, against the tools callable *right now*.
@@ -2056,6 +2059,7 @@ async fn run_tool_call_loop_impl<'a>(
                         injected_memory_preamble,
                         model_provider,
                         turn_state.history,
+                        &tool_outcomes,
                         provider_name,
                         model,
                         dispatch_model,
@@ -2303,6 +2307,14 @@ async fn run_tool_call_loop_impl<'a>(
             context_limits,
         );
         let context_token_budget = active_context_limits.context_token_budget;
+        if hook_appended_suffix_only {
+            crate::agent::history_trim::compact_active_tool_results(
+                &mut provider_request_messages[..pre_hook_messages.len()],
+                &prepared_source_rows,
+                &tool_outcomes,
+                context_token_budget,
+            );
+        }
         let model_context_window = active_context_limits.model_context_window;
         // Zero disables proactive trimming, but model capacity still applies.
         let trim_budget = dispatch_trim_budget(active_context_limits);
@@ -3627,6 +3639,15 @@ async fn run_tool_call_loop_impl<'a>(
             }
         }
 
+        for (_, id, outcome) in ordered_results.iter().flatten() {
+            if let Some(id) = id {
+                tool_outcomes
+                    .entry(id.clone())
+                    .and_modify(|ok| *ok = false)
+                    .or_insert(outcome.success);
+            }
+        }
+
         let CollectedResults {
             individual_results,
             tool_results,
@@ -3774,6 +3795,7 @@ async fn run_tool_call_loop_impl<'a>(
         injected_memory_preamble,
         model_provider,
         turn_state.history,
+        &tool_outcomes,
         provider_name,
         model,
         dispatch_model,
@@ -11075,6 +11097,7 @@ mod tool_lifecycle_abandonment_tests {
     /// Provider that hands out scripted responses in order; falls back to a
     /// text-only response once the script is exhausted.
     struct ScriptedProvider {
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
         responses: Mutex<Vec<ChatResponse>>,
     }
 
@@ -11109,10 +11132,14 @@ mod tool_lifecycle_abandonment_tests {
 
         async fn chat(
             &self,
-            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
             let mut queue = self.responses.lock().expect("script queue lock");
             if queue.is_empty() {
                 return Ok(text_response());
@@ -11256,6 +11283,7 @@ mod tool_lifecycle_abandonment_tests {
             parallel_tools,
             cancellation_token,
             history,
+            3,
             0,
             None,
         )
@@ -11273,6 +11301,7 @@ mod tool_lifecycle_abandonment_tests {
         parallel_tools: bool,
         cancellation_token: Option<CancellationToken>,
         history: &mut Vec<ChatMessage>,
+        max_tool_iterations: usize,
         context_token_budget: usize,
         image_cache: Option<ToolLoopImageState<'_>>,
     ) -> anyhow::Result<String> {
@@ -11296,7 +11325,7 @@ mod tool_lifecycle_abandonment_tests {
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                 config: None,
-                max_tool_iterations: 3,
+                max_tool_iterations,
                 hooks,
                 excluded_tools: &[],
                 dedup_exempt_tools: &[],
@@ -11343,6 +11372,99 @@ mod tool_lifecycle_abandonment_tests {
         tools: Vec<Box<dyn crate::tools::Tool>>,
     ) -> crate::tools::scoped::ScopedToolRegistry {
         crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools)
+    }
+
+    #[tokio::test]
+    async fn active_compaction_reaches_regular_and_final_provider_requests() {
+        for iteration_cap in [4, 5] {
+            let payload = "evidence ".repeat(350);
+            let responses = (0..4)
+                .map(|n| ChatResponse {
+                    text: None,
+                    tool_calls: vec![tool_call(
+                        &format!("round_{n}"),
+                        "echo",
+                        serde_json::json!({"n": n, "data": payload}),
+                    )],
+                    usage: None,
+                    reasoning_content: None,
+                })
+                .collect();
+            let provider = ScriptedProvider {
+                requests: Mutex::default(),
+                responses: Mutex::new(responses),
+            };
+            let mut history = vec![ChatMessage::user("collect four observations")];
+            let registry = registry_with(vec![Box::new(EchoTool {
+                name: "echo".into(),
+            })]);
+            let budget = 8_000;
+            run_scripted_loop_with_budget(
+                &provider,
+                &registry,
+                &NoopObserver,
+                None,
+                &zeroclaw_config::schema::PacingConfig::default(),
+                "active-compaction",
+                false,
+                None,
+                &mut history,
+                iteration_cap,
+                budget,
+                None,
+            )
+            .await
+            .unwrap();
+
+            {
+                let requests = provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), 5);
+                let final_request = &requests[4];
+                let raw: Vec<_> = history.iter().filter(|m| m.role == "tool").collect();
+                let sent: Vec<_> = final_request.iter().filter(|m| m.role == "tool").collect();
+                assert_eq!((raw.len(), sent.len()), (4, 4));
+                let estimate = crate::agent::history::estimate_history_tokens(&history);
+                assert!(
+                    estimate > budget * 7 / 10 && estimate < budget,
+                    "{estimate}"
+                );
+                assert!(raw.iter().all(|m| m.content.contains(&payload)));
+                assert!(sent[0].content.contains("Completed tool result"));
+                assert!(sent[1..].iter().all(|m| m.content.contains(&payload)));
+                assert!(
+                    requests[..4]
+                        .iter()
+                        .flatten()
+                        .all(|m| !m.content.contains("Completed tool result"))
+                );
+            }
+            // Restore the source through the fourth completed result, as after an
+            // interruption before the final answer. The empty provider script
+            // requests no new execution and receives all four original results.
+            history.truncate(history.iter().rposition(|m| m.role == "tool").unwrap() + 1);
+            run_scripted_loop_with_budget(
+                &provider,
+                &registry,
+                &NoopObserver,
+                None,
+                &zeroclaw_config::schema::PacingConfig::default(),
+                "resumed-compaction",
+                false,
+                None,
+                &mut history,
+                iteration_cap,
+                budget,
+                None,
+            )
+            .await
+            .unwrap();
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 6);
+            let restored: Vec<_> = requests[5].iter().filter(|m| m.role == "tool").collect();
+            assert_eq!(restored.len(), 4);
+            assert!(restored.iter().all(|m| m.content.contains(&payload)));
+            assert_eq!(history.iter().filter(|m| m.role == "tool").count(), 4);
+        }
     }
 
     struct ImageRecoveryProvider {
@@ -11432,6 +11554,7 @@ mod tool_lifecycle_abandonment_tests {
             false,
             None,
             &mut history,
+            3,
             // Fit the retained image, prompt framing and trim breadcrumb.
             crate::agent::history::IMAGE_TOKEN_ESTIMATE + 1_000,
             Some(ToolLoopImageState {
@@ -11498,6 +11621,7 @@ mod tool_lifecycle_abandonment_tests {
                 false,
                 None,
                 &mut history,
+                3,
                 0,
                 owned.then_some(ToolLoopImageState {
                     cache: &mut cache,
@@ -11567,6 +11691,7 @@ mod tool_lifecycle_abandonment_tests {
             false,
             None,
             &mut history,
+            3,
             0,
             Some(ToolLoopImageState {
                 cache: &mut cache,
@@ -11657,6 +11782,7 @@ mod tool_lifecycle_abandonment_tests {
         let budget = crate::agent::history::estimate_history_tokens(&history) + 10;
 
         let provider = ScriptedProvider {
+            requests: Mutex::default(),
             responses: Mutex::new(vec![text_response()]),
         };
         let registry = registry_with(Vec::new());
@@ -11673,6 +11799,7 @@ mod tool_lifecycle_abandonment_tests {
             false,
             None,
             &mut history,
+            3,
             budget,
             None,
         )
@@ -11695,6 +11822,7 @@ mod tool_lifecycle_abandonment_tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
         let provider = ScriptedProvider {
+            requests: Mutex::default(),
             responses: Mutex::new(vec![ChatResponse {
                 text: None,
                 tool_calls: vec![
@@ -11748,6 +11876,7 @@ mod tool_lifecycle_abandonment_tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
         let provider = ScriptedProvider {
+            requests: Mutex::default(),
             responses: Mutex::new(vec![ChatResponse {
                 text: None,
                 tool_calls: vec![tool_call(
@@ -11796,6 +11925,7 @@ mod tool_lifecycle_abandonment_tests {
         let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
         let token = CancellationToken::new();
         let provider = ScriptedProvider {
+            requests: Mutex::default(),
             responses: Mutex::new(vec![ChatResponse {
                 text: None,
                 tool_calls: vec![
@@ -11965,6 +12095,7 @@ mod tool_lifecycle_abandonment_tests {
         }));
         let token = CancellationToken::new();
         let provider = ScriptedProvider {
+            requests: Mutex::default(),
             responses: Mutex::new(vec![ChatResponse {
                 text: None,
                 tool_calls: vec![tool_call(
