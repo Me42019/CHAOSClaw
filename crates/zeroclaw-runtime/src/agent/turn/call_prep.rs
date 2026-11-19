@@ -10,8 +10,8 @@ use super::events::{
     send_progress,
 };
 use super::outcome::ToolLoopCancelled;
-use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use super::redact::{scrub_credentials, tool_log_attrs};
+use crate::agent::tool_execution::{ToolDispatchContext, ToolExecutionOutcome, dispatch_tool_name};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -51,6 +51,7 @@ fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (Strin
 async fn record_duplicate_tool_call(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
+    resolved_tool: Option<&str>,
     tool_args: &serde_json::Value,
     iteration: usize,
 ) -> ToolExecutionOutcome {
@@ -61,15 +62,17 @@ async fn record_duplicate_tool_call(
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
             .with_category(::zeroclaw_log::EventCategory::Tool)
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "model": ctx.model,
-                "iteration": iteration + 1,
-                "tool": tool_name,
-                "arguments": scrub_credentials(&tool_args.to_string()),
-                "result": duplicate,
-                "deduplicated": true,
-                "trace_id": ctx.turn_id,
-            })),
+            .with_attrs(tool_log_attrs(
+                resolved_tool,
+                ::serde_json::json!({
+                    "model": ctx.model,
+                    "iteration": iteration + 1,
+                    "tool": tool_name,
+                    "deduplicated": true,
+                    "trace_id": ctx.turn_id,
+                }),
+                || ::serde_json::json!({"arguments": tool_args, "result": duplicate})
+            )),
         "tool_call_result"
     );
     if let Some(tx) = ctx.on_delta {
@@ -109,8 +112,7 @@ async fn record_undispatchable_tool_call(
                 "model": ctx.model,
                 "iteration": iteration + 1,
                 "tool": tool_name,
-                "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
-                "output": scrub_credentials(&outcome.output),
+                "undispatchable": true,
                 "trace_id": ctx.turn_id,
             })),
         "tool_call_result"
@@ -189,6 +191,12 @@ pub(crate) async fn prepare_tool_calls(
     // prepared tool name it would have executed under.
     let mut retained_hook_contexts: Vec<(ToolCallHookContext, String)> = Vec::new();
 
+    let dispatch = ToolDispatchContext {
+        tools_registry,
+        activated_tools,
+        excluded_tools,
+        model_switch_callback: None,
+    };
     for (idx, call) in tool_calls.iter().enumerate() {
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
@@ -207,21 +215,35 @@ pub(crate) async fn prepare_tool_calls(
                     // The before phase ran, so this context's only terminal
                     // lifecycle operation is abandonment.
                     abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel).with_category(::zeroclaw_log::EventCategory::Tool).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
+                    let resolved_tool = dispatch_tool_name(&tool_name, dispatch);
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_attrs(tool_log_attrs(
+                                resolved_tool.as_deref(),
+                                ::serde_json::json!({
+                                    "tool": call.name,
+                                    "tool_call_id": call.tool_call_id,
+                                    "trace_id": ctx.turn_id,
+                                }),
+                                || ::serde_json::json!({"reason": reason.to_string()})
+                            )),
+                        "tool call cancelled by hook"
+                    );
                     let cancelled = format!("Cancelled by hook: {reason}");
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
                             .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
+                            .with_attrs(tool_log_attrs(resolved_tool.as_deref(), ::serde_json::json!({
                                 "model": ctx.model,
                                 "iteration": iteration + 1,
                                 "tool": call.name,
-                                "arguments": scrub_credentials(&tool_args.to_string()),
-                                "result": cancelled,
+                                "tool_call_id": call.tool_call_id,
                                 "trace_id": ctx.turn_id,
-                            })),
+                            }), || ::serde_json::json!({"arguments": tool_args, "result": cancelled}))),
                         "tool_call_result"
                     );
                     if let Some(tx) = ctx.on_delta {
@@ -259,6 +281,8 @@ pub(crate) async fn prepare_tool_calls(
             }
         }
 
+        let resolved_tool = dispatch_tool_name(&tool_name, dispatch);
+        let resolved_tool = resolved_tool.as_deref();
         maybe_inject_channel_delivery_defaults(
             &tool_name,
             &mut tool_args,
@@ -286,12 +310,6 @@ pub(crate) async fn prepare_tool_calls(
                 .iter()
                 .any(|prepared| prepared.name == crate::tools::ToolSearchTool::NAME)
         {
-            let dispatch = crate::agent::tool_execution::ToolDispatchContext {
-                tools_registry,
-                activated_tools,
-                excluded_tools,
-                model_switch_callback: None,
-            };
             // One id for the observer events and the stream pair, as the
             // executor uses for an id-less text-protocol call.
             let call_id = super::events::resolve_tool_call_id(call);
@@ -327,8 +345,14 @@ pub(crate) async fn prepare_tool_calls(
             let prompt_signature = tool_call_signature(&tool_name, &tool_args);
             pending_prompt_signature = Some(prompt_signature.clone());
             if !prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone()) {
-                let duplicate =
-                    record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
+                let duplicate = record_duplicate_tool_call(
+                    ctx,
+                    &tool_name,
+                    resolved_tool,
+                    &tool_args,
+                    iteration,
+                )
+                .await;
                 abandon_prepared_context(ctx, &hook_context, &tool_name).await;
                 ordered_results[idx] =
                     Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
@@ -342,14 +366,17 @@ pub(crate) async fn prepare_tool_calls(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "model": ctx.model,
-                            "iteration": iteration + 1,
-                            "tool": tool_name.clone(),
-                            "arguments": scrub_credentials(&tool_args.to_string()),
-                            "result": repeated,
-                            "trace_id": ctx.turn_id,
-                        })),
+                        .with_attrs(tool_log_attrs(
+                            resolved_tool,
+                            ::serde_json::json!({
+                                "model": ctx.model,
+                                "iteration": iteration + 1,
+                                "tool": tool_name,
+                                "tool_call_id": call.tool_call_id,
+                                "trace_id": ctx.turn_id,
+                            }),
+                            || ::serde_json::json!({"arguments": tool_args, "result": repeated})
+                        )),
                     "tool_call_result"
                 );
                 if let Some(tx) = ctx.on_delta {
@@ -381,33 +408,41 @@ pub(crate) async fn prepare_tool_calls(
             index: u32::try_from(idx + 1).unwrap_or(u32::MAX),
             total: u32::try_from(tool_calls.len()).unwrap_or(u32::MAX),
         };
-        let approved =
-            match gate_tool_approval(ctx, &tool_name, &tool_args, iteration, position).await {
-                ApprovalGateOutcome::Proceed { approved } => approved,
-                ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
-                    // The before phase ran but this call will never execute:
-                    // its only terminal lifecycle operation is abandonment.
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    // Streaming consumers see the denied/replaced call and its
-                    // synthesized result (e.g. a DenyWithEdit replacement) as a
-                    // ToolCall/ToolResult pair, as the direct path always did.
-                    if let Some(tx) = ctx.event_tx {
-                        emit_tool_call_pair(tx, call, &outcome).await;
-                    }
-                    ordered_results[idx] =
-                        Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
-                    continue;
+        let approved = match gate_tool_approval(
+            ctx,
+            &tool_name,
+            resolved_tool,
+            &tool_args,
+            iteration,
+            position,
+        )
+        .await
+        {
+            ApprovalGateOutcome::Proceed { approved } => approved,
+            ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
+                // The before phase ran but this call will never execute:
+                // its only terminal lifecycle operation is abandonment.
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                // Streaming consumers see the denied/replaced call and its
+                // synthesized result (e.g. a DenyWithEdit replacement) as a
+                // ToolCall/ToolResult pair, as the direct path always did.
+                if let Some(tx) = ctx.event_tx {
+                    emit_tool_call_pair(tx, call, &outcome).await;
                 }
-                ApprovalGateOutcome::Cancelled => {
-                    // Preparation aborts before execution takes ownership of
-                    // the retained contexts or the call awaiting approval.
-                    for (retained_context, retained_tool) in &retained_hook_contexts {
-                        abandon_prepared_context(ctx, retained_context, retained_tool).await;
-                    }
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    return Err(ToolLoopCancelled.into());
+                ordered_results[idx] =
+                    Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                continue;
+            }
+            ApprovalGateOutcome::Cancelled => {
+                // Preparation aborts before execution takes ownership of
+                // the retained contexts or the call awaiting approval.
+                for (retained_context, retained_tool) in &retained_hook_contexts {
+                    abandon_prepared_context(ctx, retained_context, retained_tool).await;
                 }
-            };
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                return Err(ToolLoopCancelled.into());
+            }
+        };
         // An approved call is not an approval loop: drop its signature from
         // the turn-scoped guard so a later identical call (a rerun the user
         // asked for, a re-check after an edit) gets a fresh approval prompt.
@@ -433,23 +468,29 @@ pub(crate) async fn prepare_tool_calls(
             ctx.dedup_exempt_tools.iter().any(|e| e == &tool_name) || reentrant_agent_tool;
         if dedup_enabled && !dedup_exempt && !seen_tool_signatures.insert(signature) {
             let duplicate =
-                record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
+                record_duplicate_tool_call(ctx, &tool_name, resolved_tool, &tool_args, iteration)
+                    .await;
             abandon_prepared_context(ctx, &hook_context, &tool_name).await;
             ordered_results[idx] = Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
             continue;
         }
 
+        let call_id = super::events::resolve_tool_call_id(call);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
                 .with_category(::zeroclaw_log::EventCategory::Tool)
-                .with_attrs(::serde_json::json!({
-                    "model": ctx.model,
-                    "iteration": iteration + 1,
-                    "tool": tool_name.clone(),
-                    "arguments": scrub_credentials(&tool_args.to_string()),
-                    "trace_id": ctx.turn_id,
-                })),
+                .with_attrs(tool_log_attrs(
+                    resolved_tool,
+                    ::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": tool_name,
+                        "tool_call_id": call_id,
+                        "trace_id": ctx.turn_id,
+                    }),
+                    || ::serde_json::json!({"arguments": tool_args})
+                )),
             "tool_call_start"
         );
 
@@ -486,11 +527,6 @@ pub(crate) async fn prepare_tool_calls(
         // responsibility: the after hook on completion, or abandonment if the
         // execution phase aborts before post-execution handling.
         retained_hook_contexts.push((hook_context, tool_name.clone()));
-        let call_id = super::events::resolve_tool_call_id(&ParsedToolCall {
-            name: tool_name.clone(),
-            arguments: tool_args.clone(),
-            tool_call_id: call.tool_call_id.clone(),
-        });
         // Pin the resolved id onto the executable call so the pending ToolCall
         // and the terminal ToolResult (both emitted by the executor at dispatch
         // and completion) share one correlation id, even for id-less
@@ -513,7 +549,7 @@ pub(crate) async fn prepare_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::{PreparedToolCalls, prepare_tool_calls};
-    use crate::agent::tool_execution::ToolExecutionOutcome;
+    use crate::agent::tool_execution::{CompletedToolExecution, ToolExecutionOutcome};
     use crate::agent::turn::context::TurnCtx;
     use crate::agent::turn::post_exec::record_executed_outcomes;
     use crate::agent::turn::{DraftEvent, StreamDelta};
@@ -615,6 +651,248 @@ mod tests {
         }
     }
 
+    const LOG_POLICY_TEST_MODE: &str = "ZEROCLAW_TEST_STRUCTURED_TOOL_LOG_POLICY";
+    const SHORT_SECRET: &str = "s7YpR21";
+    const TEXT_SECRET: &str = "synthetic_credential_value_only_for_test";
+    const DETAIL_TAIL: &str = "visible-policy-test-tail";
+    const DENIED_DETAIL: &str = "denied-policy-test-private-detail";
+    const LOG_BYTES: usize = 128;
+
+    struct LogPolicyTool(&'static str);
+
+    impl Attributable for LogPolicyTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+
+        fn alias(&self) -> &str {
+            self.0
+        }
+    }
+
+    #[async_trait]
+    impl Tool for LogPolicyTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "Synthetic tool for the logging policy regression"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let error = format!("password={TEXT_SECRET} {}", args["note"]);
+            if self.0 == "policy_error" {
+                anyhow::bail!(error);
+            }
+            let success = self.0 != "policy_failure";
+            Ok(ToolResult {
+                success,
+                output: zeroclaw_api::tool::ToolOutput::json(args),
+                error: (!success).then_some(error),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_tool_log_policy_applies_to_all_sinks() {
+        let Ok(mode) = std::env::var(LOG_POLICY_TEST_MODE) else {
+            // The real subscriber and logging configuration are global.
+            // Isolate each configuration from the rest of the test suite.
+            let test_name = concat!(
+                module_path!(),
+                "::structured_tool_log_policy_applies_to_all_sinks"
+            );
+            let test_name = test_name.split_once("::").unwrap().1;
+            for mode in ["off", "redacted", "full"] {
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env(LOG_POLICY_TEST_MODE, mode)
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8(child.stdout).unwrap();
+                let stderr = String::from_utf8(child.stderr).unwrap();
+                assert!(child.status.success(), "{mode}: {stdout}\n{stderr}");
+                assert!(stdout.contains("1 passed"));
+                for tool in [
+                    "policy_success",
+                    "policy_failure",
+                    "policy_error",
+                    "policy_hidden",
+                ] {
+                    assert!(stderr.contains(tool), "{mode}: missing verbose tool {tool}");
+                }
+                for marker in [SHORT_SECRET, TEXT_SECRET, DENIED_DETAIL] {
+                    assert!(
+                        !stderr.contains(marker),
+                        "{mode}: verbose log leaked {marker}"
+                    );
+                }
+                assert_eq!(stderr.contains(DETAIL_TAIL), mode == "full");
+                assert_eq!(stderr.contains("output_truncated"), mode == "redacted");
+                assert_eq!(stderr.contains("[REDACTED]"), mode != "off");
+            }
+            return;
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "full".into(),
+                log_tool_io: mode.clone(),
+                log_tool_io_denylist: vec!["mcp__policy_hidden".into()],
+                log_tool_io_truncate_bytes: LOG_BYTES,
+                ..Default::default()
+            },
+            directory.path(),
+        );
+        zeroclaw_log::install_global_subscriber(Some("debug"), "info", true);
+        let mut broadcast = zeroclaw_log::subscribe_or_install();
+
+        let tools: Vec<Box<dyn Tool>> = ["policy_success", "policy_failure", "policy_error"]
+            .into_iter()
+            .map(|name| Box::new(LogPolicyTool(name)) as Box<dyn Tool>)
+            .collect();
+        let mut activated = crate::tools::ActivatedToolSet::new();
+        activated.activate(
+            "mcp__policy_hidden".into(),
+            Arc::new(LogPolicyTool("mcp__policy_hidden")),
+        );
+        let activated = Arc::new(std::sync::Mutex::new(activated));
+
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = test_ctx(&observer, &pacing, &tx);
+        ctx.on_delta = None;
+        let calls: Vec<_> = [
+            "policy_success",
+            "policy_failure",
+            "policy_error",
+            "policy_hidden",
+        ]
+        .iter()
+        .map(|name| {
+            let note = if *name == "policy_hidden" {
+                DENIED_DETAIL.to_string()
+            } else {
+                format!("{} {DETAIL_TAIL}", "é".repeat(LOG_BYTES))
+            };
+            parsed_call(
+                name,
+                serde_json::json!({"access_token": SHORT_SECRET, "note": note}),
+                name,
+            )
+        })
+        .collect();
+        let mut prepared = prepare_tool_calls(
+            &ctx,
+            &tools,
+            Some(&activated),
+            &[],
+            &calls,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+            false,
+        )
+        .await
+        .unwrap();
+        let completed = crate::agent::tool_execution::execute_tools_sequential(
+            &prepared.executable_calls,
+            crate::agent::tool_execution::ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: Some(&activated),
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &ctx.meta(),
+            &observer,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect();
+        record_executed_outcomes(
+            &ctx,
+            &prepared.executable_indices,
+            &prepared.executable_calls,
+            &prepared.stream_calls,
+            completed,
+            &mut prepared.ordered_results,
+            0,
+        )
+        .await;
+
+        // The policy changes diagnostic events only. Successful tool output
+        // and the native call arguments still flow to their normal consumers.
+        assert!(outcome_at(&prepared, 0).output.contains(SHORT_SECRET));
+        assert!(outcome_at(&prepared, 3).output.contains(DENIED_DETAIL));
+        assert!(!outcome_at(&prepared, 1).success);
+        assert!(!outcome_at(&prepared, 2).success);
+        zeroclaw_log::flush().unwrap();
+        let trace = std::fs::read_to_string(zeroclaw_log::runtime_trace_path().unwrap()).unwrap();
+        let disk: Vec<serde_json::Value> = trace
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut live = Vec::new();
+        while let Ok(event) = broadcast.try_recv() {
+            live.push(event);
+        }
+        assert_eq!(disk, live, "JSONL and broadcast differ for {mode}");
+        assert_eq!(disk.len(), 16, "four events for each of the four tools");
+        for marker in [SHORT_SECRET, TEXT_SECRET, DENIED_DETAIL] {
+            assert!(
+                !trace.contains(marker),
+                "{mode}: structured log leaked {marker}"
+            );
+        }
+        assert_eq!(trace.contains(DETAIL_TAIL), mode == "full");
+        for event in &disk {
+            let attrs = event["attributes"].as_object().unwrap();
+            assert_eq!(attrs["trace_id"], "test-turn");
+            assert_eq!(attrs["tool_call_id"], attrs["tool"]);
+            if mode == "off" || attrs["tool"] == "policy_hidden" {
+                for field in ["input", "arguments", "output", "error", "error_reason"] {
+                    assert!(!attrs.contains_key(field), "{mode}: unexpected {field}");
+                }
+            }
+            if mode == "redacted" {
+                for field in ["input", "arguments", "output", "error", "error_reason"] {
+                    if attrs.get(&format!("{field}_truncated")).is_some() {
+                        let captured = attrs[field].as_str().unwrap();
+                        assert!(captured.len() <= LOG_BYTES);
+                        assert!(
+                            attrs[&format!("{field}_original_bytes")].as_u64().unwrap()
+                                > LOG_BYTES as u64
+                        );
+                    }
+                }
+            }
+        }
+        for (tool, action, outcome) in [
+            ("policy_success", "complete", "success"),
+            ("policy_failure", "fail", "failure"),
+            ("policy_error", "fail", "failure"),
+            ("policy_hidden", "complete", "success"),
+        ] {
+            assert!(disk.iter().any(|event| {
+                event["attributes"]["tool"] == tool
+                    && event["event"]["action"] == action
+                    && event["event"]["outcome"] == outcome
+            }));
+        }
+    }
+
     async fn emitted_tool_provenance(
         tools_registry: Vec<Box<dyn Tool>>,
         tool_name: &str,
@@ -649,14 +927,17 @@ mod tests {
             &prepared.executable_indices,
             &prepared.executable_calls,
             &prepared.stream_calls,
-            vec![ToolExecutionOutcome {
-                output: "ok".to_string(),
-                attachments: Vec::new(),
-                output_data: None,
-                success: true,
-                error_reason: None,
-                duration: Duration::ZERO,
-                receipt: None,
+            vec![CompletedToolExecution {
+                executed_tool_name: Some(tool_name.to_string()),
+                outcome: ToolExecutionOutcome {
+                    output: "ok".to_string(),
+                    attachments: Vec::new(),
+                    output_data: None,
+                    success: true,
+                    error_reason: None,
+                    duration: Duration::ZERO,
+                    receipt: None,
+                },
             }],
             &mut prepared.ordered_results,
             0,
@@ -906,14 +1187,17 @@ mod tests {
             &prepared.executable_indices,
             &prepared.executable_calls,
             &prepared.stream_calls,
-            vec![ToolExecutionOutcome {
-                output: "ok".to_string(),
-                attachments: Vec::new(),
-                output_data: None,
-                success: true,
-                error_reason: None,
-                duration: Duration::ZERO,
-                receipt: None,
+            vec![CompletedToolExecution {
+                executed_tool_name: Some("dup_tool".to_string()),
+                outcome: ToolExecutionOutcome {
+                    output: "ok".to_string(),
+                    attachments: Vec::new(),
+                    output_data: None,
+                    success: true,
+                    error_reason: None,
+                    duration: Duration::ZERO,
+                    receipt: None,
+                },
             }],
             &mut prepared.ordered_results,
             0,

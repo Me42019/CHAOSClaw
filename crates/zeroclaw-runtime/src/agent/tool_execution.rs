@@ -14,6 +14,7 @@ use zeroclaw_api::tool::{ToolExecutionCancelled, ToolExecutionContext};
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
+use super::turn::redact::tool_log_attrs;
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -422,23 +423,6 @@ async fn execute_one_tool_with_provenance(
         tool = %call_name,
     );
 
-    // Auto tool I/O propagation: emit Start with full input, run the
-    // tool, then emit Complete or Fail with full output. Per-tool
-    // execute() impls add zero logging.
-    let _start_guard = tool_span.clone().entered();
-    ::zeroclaw_log::record!(
-        DEBUG,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
-            .with_category(::zeroclaw_log::EventCategory::Tool)
-            .with_attrs(::serde_json::json!({
-                "tool": call_name,
-                "tool_call_id": tool_call_id,
-                "input": call_arguments,
-            })),
-        format!("tool call: {call_name}")
-    );
-    drop(_start_guard);
-
     // Stable correlation id for this call's pending ToolCall and terminal
     // ToolResult. Native calls carry their own id; id-less text-protocol calls
     // get one synthesized UUID reused for both halves so ACP/WS clients key the
@@ -446,6 +430,28 @@ async fn execute_one_tool_with_provenance(
     let event_call_id = tool_call_id_owned
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Capture detail through the log policy before any sink sees it.
+    {
+        let _start_guard = tool_span.clone().entered();
+        if zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_attrs(tool_log_attrs(
+                        Some(tool.name()),
+                        ::serde_json::json!({
+                            "tool": call_name,
+                            "tool_call_id": event_call_id,
+                            "trace_id": meta.turn_id,
+                        }),
+                        || ::serde_json::json!({"input": call_arguments})
+                    )),
+                format!("tool call: {call_name}")
+            );
+        }
+    }
 
     if let Some(tx) = event_tx {
         let _ = tx
@@ -478,7 +484,7 @@ async fn execute_one_tool_with_provenance(
         match tool_result {
             Ok(r) => {
                 let duration = start.elapsed();
-                if r.success {
+                if r.success && zeroclaw_log::debug_enabled() {
                     ::zeroclaw_log::record!(
                         DEBUG,
                         ::zeroclaw_log::Event::new(
@@ -488,28 +494,37 @@ async fn execute_one_tool_with_provenance(
                         .with_category(::zeroclaw_log::EventCategory::Tool)
                         .with_outcome(::zeroclaw_log::EventOutcome::Success)
                         .with_duration(duration.as_millis() as u64)
-                        .with_attrs(::serde_json::json!({
-                            "tool": call_name,
-                            "tool_call_id": tool_call_id,
-                            "input": call_arguments,
-                            "output": r.output,
-                        })),
+                        .with_attrs(tool_log_attrs(
+                            Some(tool.name()),
+                            ::serde_json::json!({
+                                "tool": call_name,
+                                "tool_call_id": event_call_id,
+                                "trace_id": meta.turn_id,
+                            }),
+                            || ::serde_json::json!({"input": call_arguments, "output": r.output})
+                        )),
                         format!("tool result: {call_name}")
                     );
-                } else {
+                } else if !r.success {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_duration(duration.as_millis() as u64)
-                            .with_attrs(::serde_json::json!({
-                                "tool": call_name,
-                                "tool_call_id": tool_call_id,
-                                "input": call_arguments,
-                                "error": r.error.clone().unwrap_or_default(),
-                                "output": r.output,
-                            })),
+                            .with_attrs(tool_log_attrs(
+                                Some(tool.name()),
+                                ::serde_json::json!({
+                                    "tool": call_name,
+                                    "tool_call_id": event_call_id,
+                                    "trace_id": meta.turn_id,
+                                }),
+                                || ::serde_json::json!({
+                                    "input": call_arguments,
+                                    "error": r.error.as_deref().unwrap_or_default(),
+                                    "output": r.output,
+                                })
+                            )),
                         format!("tool failed: {call_name}")
                     );
                 }
@@ -604,12 +619,15 @@ async fn execute_one_tool_with_provenance(
                         .with_category(::zeroclaw_log::EventCategory::Tool)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_duration(duration.as_millis() as u64)
-                        .with_attrs(::serde_json::json!({
-                            "tool": call_name,
-                            "tool_call_id": tool_call_id,
-                            "input": call_arguments,
-                            "error": format!("{e:?}"),
-                        })),
+                        .with_attrs(tool_log_attrs(
+                            Some(tool.name()),
+                            ::serde_json::json!({
+                                "tool": call_name,
+                                "tool_call_id": event_call_id,
+                                "trace_id": meta.turn_id,
+                            }),
+                            || ::serde_json::json!({"input": call_arguments, "error": format!("{e:?}")}),
+                        )),
                     format!("tool error: {call_name}")
                 );
                 let reason = format!("Error executing {}: {e}", tool.name());
