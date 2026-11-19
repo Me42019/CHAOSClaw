@@ -7,6 +7,7 @@
 //! token in a 4xx/5xx body is not forwarded to the model provider.
 
 use regex::Regex;
+use serde_json::Value;
 use std::sync::LazyLock;
 
 pub(crate) static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -80,8 +81,12 @@ pub fn is_credential_key(key: &str) -> bool {
 /// walks the value instead. Same rendering-boundary contract as
 /// [`scrub_credentials`].
 pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
+    scrub_credential_values(value, scrub_credentials)
+}
+
+fn scrub_credential_values(value: Value, scrub_text: fn(&str) -> String) -> Value {
     match value {
-        serde_json::Value::Object(map) => {
+        Value::Object(map) => {
             let scrubbed = map
                 .into_iter()
                 .map(|(key, val)| {
@@ -91,18 +96,108 @@ pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
                             serde_json::Value::String(REDACTED_CREDENTIAL_VALUE.to_string()),
                         )
                     } else {
-                        (key, scrub_credentials_value(val))
+                        (key, scrub_credential_values(val, scrub_text))
                     }
                 })
                 .collect();
-            serde_json::Value::Object(scrubbed)
+            Value::Object(scrubbed)
         }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(scrub_credentials_value).collect())
-        }
-        serde_json::Value::String(s) => serde_json::Value::String(scrub_credentials(&s)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| scrub_credential_values(item, scrub_text))
+                .collect(),
+        ),
+        Value::String(s) => Value::String(scrub_text(&s)),
         other => other,
     }
+}
+
+fn scrub_tool_log_text(text: &str) -> String {
+    if let Some(scrubbed) = scrub_tool_log_json(text) {
+        return scrubbed;
+    }
+    // Failure outcomes can append the tool's JSON body after an error
+    // summary. Treat the body as structured even under that prefix.
+    if let Some((summary, body)) = text.rsplit_once("\n\n")
+        && let Some(scrubbed) = scrub_tool_log_json(body)
+    {
+        return format!("{}\n\n{scrubbed}", scrub_credentials(summary));
+    }
+    scrub_credentials(text)
+}
+
+fn scrub_tool_log_json(text: &str) -> Option<String> {
+    // ToolOutput can contain both structured data and a JSON display copy.
+    // Keep credential-key context on both representations.
+    if !text.trim_start().starts_with(['{', '[']) {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let scrubbed = scrub_credentials_value(value);
+    Some(if text.contains('\n') {
+        serde_json::to_string_pretty(&scrubbed).unwrap_or_else(|_| scrubbed.to_string())
+    } else {
+        scrubbed.to_string()
+    })
+}
+
+/// Attach only the approved, scrubbed and bounded detail to an agent tool log.
+/// Apply policy before record! so verbose stderr and all structured sinks see
+/// the same fields. Unresolved tool names can still emit their metadata.
+pub(crate) fn tool_log_attrs(
+    resolved_tool: Option<&str>,
+    mut metadata: Value,
+    details: impl FnOnce() -> Value,
+) -> Value {
+    let Some(resolved_tool) = resolved_tool else {
+        return metadata;
+    };
+    let Some(requested_tool) = metadata.get("tool").and_then(Value::as_str) else {
+        return metadata;
+    };
+    let captured = zeroclaw_log::with_tool_io_policy(requested_tool, resolved_tool, |policy| {
+        let Value::Object(details) = details() else {
+            unreachable!("tool log details are an object");
+        };
+        let mut fields = serde_json::Map::new();
+        for (field, value) in details {
+            let value = scrub_credential_values(value, scrub_tool_log_text);
+            let text = match &value {
+                Value::String(text) => std::borrow::Cow::Borrowed(text.as_str()),
+                other => std::borrow::Cow::Owned(other.to_string()),
+            };
+            let capture = if matches!(field.as_str(), "input" | "arguments") {
+                zeroclaw_log::capture_tool_input(policy, requested_tool, &text)
+            } else {
+                zeroclaw_log::capture_tool_output(policy, requested_tool, &text)
+            };
+            if let Some(capture) = capture {
+                if capture.truncated {
+                    fields.insert(format!("{field}_truncated"), Value::Bool(true));
+                    fields.insert(
+                        format!("{field}_original_bytes"),
+                        capture.original_bytes.into(),
+                    );
+                }
+                // Keep the historical structured input/output shape when the
+                // field fits. A clipped JSON field is a text preview.
+                let value = if capture.truncated || field == "arguments" {
+                    Value::String(capture.text)
+                } else {
+                    value
+                };
+                fields.insert(field, value);
+            }
+        }
+        fields
+    });
+    if let Some(fields) = captured
+        && let Some(metadata) = metadata.as_object_mut()
+    {
+        metadata.extend(fields);
+    }
+    metadata
 }
 
 #[cfg(test)]

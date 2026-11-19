@@ -3,7 +3,7 @@
 
 use super::context::TurnCtx;
 use super::events::StreamDelta;
-use super::redact::scrub_credentials;
+use super::redact::tool_log_attrs;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
@@ -22,6 +22,7 @@ pub(crate) enum ApprovalGateOutcome {
 pub(crate) async fn gate_tool_approval(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
+    resolved_tool: Option<&str>,
     tool_args: &serde_json::Value,
     iteration: usize,
     position: zeroclaw_api::channel::ApprovalPosition,
@@ -103,7 +104,11 @@ pub(crate) async fn gate_tool_approval(
                             )
                             .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(tool_log_attrs(
+                                resolved_tool,
+                                ::serde_json::json!({"tool": tool_name, "trace_id": ctx.turn_id}),
+                                || ::serde_json::json!({"error": e.to_string()}),
+                            )),
                             "Channel approval request failed"
                         );
                         None
@@ -195,12 +200,10 @@ pub(crate) async fn gate_tool_approval(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
+                    .with_attrs(tool_log_attrs(resolved_tool, ::serde_json::json!({
                         "model": ctx.model,
                         "iteration": iteration + 1,
                         "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
-                        "result": denied,
                         "trace_id": ctx.turn_id,
                         // Operator-facing only. The remedy lives here rather than
                         // in `result`, which is shown to the model: deciding to
@@ -223,7 +226,7 @@ pub(crate) async fn gate_tool_approval(
                         } else {
                             None
                         },
-                    })),
+                    }), || ::serde_json::json!({"arguments": tool_args, "result": denied}))),
                 "tool_call_result"
             );
             if let Some(tx) = ctx.on_delta {
@@ -259,15 +262,17 @@ pub(crate) async fn gate_tool_approval(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
                     .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "model": ctx.model,
-                        "iteration": iteration + 1,
-                        "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
-                        "replaced": true,
-                        "output": scrub_credentials(replacement),
-                        "trace_id": ctx.turn_id,
-                    })),
+                    .with_attrs(tool_log_attrs(
+                        resolved_tool,
+                        ::serde_json::json!({
+                            "model": ctx.model,
+                            "iteration": iteration + 1,
+                            "tool": tool_name,
+                            "replaced": true,
+                            "trace_id": ctx.turn_id,
+                        }),
+                        || ::serde_json::json!({"arguments": tool_args, "output": replacement})
+                    )),
                 "tool_call_result"
             );
             return ApprovalGateOutcome::Replace(ToolExecutionOutcome {
@@ -428,6 +433,15 @@ mod tests {
         };
 
         assert!(std::fs::File::open("/dev/tty").is_err());
+        let log_dir = tempfile::tempdir().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                log_tool_io: "redacted".into(),
+                ..Default::default()
+            },
+            log_dir.path(),
+        );
         zeroclaw_log::try_install_capture_subscriber();
         let mut log_events = zeroclaw_log::subscribe_or_install();
         let observer = NoopObserver;
@@ -447,6 +461,7 @@ mod tests {
         let outcome = gate_tool_approval(
             &ctx,
             "shell",
+            Some("shell"),
             &serde_json::json!({"command": "true"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
@@ -558,6 +573,7 @@ mod tests {
         match gate_tool_approval(
             &ctx,
             "shell",
+            Some("shell"),
             &serde_json::json!({"command": "ls"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
@@ -582,6 +598,7 @@ mod tests {
         match gate_tool_approval(
             &ctx,
             "file_write",
+            Some("file_write"),
             &serde_json::json!({"path": "x"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
@@ -615,6 +632,7 @@ mod tests {
         match gate_tool_approval(
             &ctx,
             "shell",
+            Some("shell"),
             &serde_json::json!({"command": "ls"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
@@ -643,6 +661,7 @@ mod tests {
         match gate_tool_approval(
             &ctx,
             "file_write",
+            Some("file_write"),
             &serde_json::json!({"path": "x"}),
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
@@ -710,6 +729,7 @@ mod tests {
         let approval_wait = gate_tool_approval(
             &ctx,
             "shell",
+            Some("shell"),
             &arguments,
             0,
             zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },

@@ -4,8 +4,8 @@
 use super::call_prep::StreamToolCall;
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
-use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use super::redact::{scrub_credentials, tool_log_attrs};
+use crate::agent::tool_execution::{CompletedToolExecution, ToolExecutionOutcome};
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Record each executed tool call's outcome (upstream loop body,
@@ -17,11 +17,11 @@ pub(crate) async fn record_executed_outcomes(
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
     stream_calls: &[Option<StreamToolCall>],
-    executed_outcomes: Vec<ToolExecutionOutcome>,
+    executed_outcomes: Vec<CompletedToolExecution>,
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
 ) {
-    for (((idx, call), stream_call), outcome) in executable_indices
+    for (((idx, call), stream_call), completed) in executable_indices
         .iter()
         .zip(executable_calls.iter())
         .zip(stream_calls.iter())
@@ -32,6 +32,7 @@ pub(crate) async fn record_executed_outcomes(
         // batches interleave call->result per tool. Post-exec only records the
         // outcome to history, logs, hooks, and ordered_results.
 
+        let outcome = completed.outcome;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
@@ -42,14 +43,20 @@ pub(crate) async fn record_executed_outcomes(
                     ::zeroclaw_log::EventOutcome::Failure
                 })
                 .with_duration(u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX))
-                .with_attrs(::serde_json::json!({
-                    "model": ctx.model,
-                    "iteration": iteration + 1,
-                    "tool": call.name.clone(),
-                    "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
-                    "output": scrub_credentials(&outcome.output),
-                    "trace_id": ctx.turn_id,
-                })),
+                .with_attrs(tool_log_attrs(
+                    completed.executed_tool_name.as_deref(),
+                    ::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": call.name,
+                        "tool_call_id": call.tool_call_id,
+                        "trace_id": ctx.turn_id,
+                    }),
+                    || ::serde_json::json!({
+                        "error_reason": outcome.error_reason,
+                        "output": outcome.output,
+                    })
+                )),
             "tool_call_result"
         );
 

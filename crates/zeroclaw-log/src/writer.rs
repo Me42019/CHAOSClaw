@@ -532,6 +532,26 @@ pub fn flush_for_test() -> Result<()> {
     flush()
 }
 
+/// Build detailed tool log fields under the currently installed policy.
+///
+/// Keep this independent of disk persistence: the same event reaches terminal
+/// and broadcast consumers. Without initialized policy, retain only metadata.
+pub fn with_tool_io_policy<T>(
+    requested_tool: &str,
+    resolved_tool: &str,
+    capture: impl FnOnce(&ResolvedPolicy) -> T,
+) -> Option<T> {
+    let state = current_state()?;
+    let policy = &state.policy;
+    if !policy.tool_io.captures_io()
+        || policy.is_tool_denylisted(requested_tool)
+        || policy.is_tool_denylisted(resolved_tool)
+    {
+        return None;
+    }
+    Some(capture(policy))
+}
+
 /// Resolved LLM-request-payload capture policy + the truncate cap, for the
 /// turn engine's `announce_llm_request`. `None` when no writer is installed
 /// (the policy defaults to `off`, so callers treat "no writer" as "off").
