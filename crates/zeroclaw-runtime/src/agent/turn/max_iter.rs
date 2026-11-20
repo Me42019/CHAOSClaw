@@ -253,12 +253,8 @@ pub(super) async fn finish_after_max_iterations(
                 messages.extend(transient_suffix);
             }
             if let Some((config, cache, settings, state)) = compaction {
-                let (target, hard) = settings.limits(
-                    config,
-                    provider_name,
-                    &selected_model,
-                    context_limits.model_context_window,
-                );
+                let (target, hard) =
+                    settings.limits(config, provider_name, &selected_model, context_limits);
                 let estimated = if suffix_only {
                     state
                         .prepare(

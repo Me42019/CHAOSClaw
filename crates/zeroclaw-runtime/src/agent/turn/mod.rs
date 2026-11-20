@@ -2483,7 +2483,7 @@ async fn run_tool_call_loop_impl<'a>(
                 config,
                 active_model_provider_name,
                 provider_request_model,
-                model_context_window,
+                active_context_limits,
             );
             // Structural hook rewrites cannot be mapped back to the source rows.
             // Preserve them verbatim and apply the hard guard to their actual size.

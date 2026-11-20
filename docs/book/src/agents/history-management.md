@@ -23,9 +23,10 @@ Structured Agent sessions can opt in to source-linked compaction, including
 Gateway WebSocket and RPC sessions. The runtime keeps instructions, user
 messages, unresolved calls, and a recent tail of complete tool exchanges in
 the provider request. As the prompt grows, it replaces eligible older
-exchanges with summaries in that request. The original calls and results
-remain in session history and can be read in bounded pages using
-`history_recall` with the source ID printed in a summary.
+exchanges with summaries in that request. The summaries appear as quoted,
+untrusted tool evidence attached to the corresponding user turn. The original
+calls and results remain in session history and can be read in bounded pages
+using `history_recall` with the source ID printed in a summary.
 
 Configure a dedicated summary alias on the same local llama.cpp router used
 to serve the agent. The summarizer receives a text-only completion request
@@ -55,6 +56,9 @@ hook structurally rewrites the messages. Labels, token estimates, elapsed
 time, and outcomes appear in runtime logs. Summary text and original tool
 payloads stay out of the compaction log.
 
+The compaction threshold is a fraction of the effective prompt budget for the
+active route (the model window when the proactive budget is zero), capped by
+the model's remaining input capacity after reserving room for the reply.
 Admission counts the prepared messages and tool schemas, calibrates against
 reported prompt usage on the active route, and reserves response room using
 the provider's configured output limit when available. A protected input that
