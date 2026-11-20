@@ -348,6 +348,23 @@ pub trait SessionBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Read the derived context summaries for this already-authorized session.
+    fn load_compaction(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Checkpoint originals before using their summary. Transactional stores
+    /// also persist the derived summary index with the corresponding sources.
+    fn checkpoint_compaction(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+        _summaries: &str,
+    ) -> std::io::Result<bool> {
+        self.replace_conversation_state_if_exists(session_key, messages, breadcrumb_present)
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,

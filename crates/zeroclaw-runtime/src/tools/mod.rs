@@ -2419,6 +2419,13 @@ fn all_tools_with_runtime_on_thread(
             security.clone(),
         ))
     );
+    use crate::agent::turn::compaction::{HistoryRecall, Settings as CompactionSettings};
+    if CompactionSettings::for_agent(root_config, agent_alias).is_some() {
+        register_tool!(
+            HistoryRecall::NAME,
+            Arc::new(HistoryRecall(security.clone()))
+        );
+    }
     register_tool!(
         "file_read",
         Arc::new(RateLimitedTool::new(
@@ -8528,11 +8535,33 @@ permissions = ["http_client"]
                 exclude: Vec::new(),
             },
         );
+        let schema = &mut cfg.providers.models.llamacpp;
+        schema.insert(
+            "inventory-summary".into(),
+            zeroclaw_config::schema::LlamacppModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("inventory-summary".into()),
+                    context_window: Some(16_384),
+                    ..Default::default()
+                },
+            },
+        );
+        let compaction_profile = zeroclaw_config::schema::RuntimeProfileConfig {
+            context_compression: zeroclaw_config::scattered_types::ContextCompressionConfig {
+                enabled: true,
+                summary_provider: "llamacpp.inventory-summary".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.runtime_profiles
+            .insert("inventory".into(), compaction_profile);
         cfg.agents.insert(
             "test-agent".into(),
             AliasedAgentConfig {
                 enabled: true,
                 model_provider: "openai.inventory".into(),
+                runtime_profile: "inventory".into(),
                 mcp_bundles: vec!["inventory".into()],
                 ..Default::default()
             },

@@ -17,6 +17,69 @@ next user message. Trimming therefore does not split a tool call from its
 result. A user message whose text happens to begin with `[Tool results]` is
 treated as part of the turn before it, not as a new turn.
 
+## Active-turn context compaction
+
+Structured Agent sessions can opt in to source-linked compaction, including
+Gateway WebSocket and RPC sessions. The runtime keeps instructions, user
+messages, unresolved calls, and a recent tail of complete tool exchanges in
+the provider request. As the prompt grows, it replaces eligible older
+exchanges with summaries in that request. The summaries appear as quoted,
+untrusted tool evidence attached to the corresponding user turn. The original
+calls and results remain in session history and can be read in bounded pages
+using `history_recall` with the source ID printed in a summary.
+
+Configure a dedicated summary alias on the same local llama.cpp router used
+to serve the agent. The summarizer receives a text-only completion request
+with no tool schemas, fallback, or agent execution context. The tool loop
+waits for the summary to finish before it asks the router for the active model
+again. On a single-model router this can reload both models and discard their
+inference caches.
+
+```toml
+[providers.models.llamacpp.lfm24]
+uri = "http://127.0.0.1:18083/v1"
+model = "chaos-lossless-lfm25-iq4xs"
+context_window = 16384
+
+[runtime_profiles.local.context_compression]
+enabled = true
+summary_provider = "llamacpp.lfm24"
+threshold_ratio = 0.75
+protect_last_n = 3
+timeout_secs = 180
+```
+
+The sample runtime profile must be assigned to the agent. If the agent's
+policy or built-in selection uses an explicit list, admit `history_recall`
+there as well. Compaction skips a request when recall is unavailable or a
+hook structurally rewrites the messages. Labels, token estimates, elapsed
+time, and outcomes appear in runtime logs. Summary text and original tool
+payloads stay out of the compaction log.
+
+The compaction threshold is a fraction of the effective prompt budget for the
+active route (the model window when the proactive budget is zero), capped by
+the model's remaining input capacity after reserving room for the reply.
+Admission counts the prepared messages and tool schemas, calibrates against
+reported prompt usage on the active route, and reserves response room using
+the provider's configured output limit when available. A protected input that
+still exceeds the remaining room stops the turn before dispatch. If LFM fails,
+the runtime keeps the previous projection and can use original context while
+it still fits. It makes no further LFM attempts in that loop invocation.
+
+The SQLite chat session backend checkpoints originals and summary links in the
+same transaction. On reconnect, cached summaries are applied only where the
+source fingerprints and complete exchange boundaries still match. Session
+retention and deletion still apply. ACP retains originals under its existing
+native session checkpoint mechanism. Without a SQLite chat session backend,
+the summary index is rebuilt from retained history when necessary. Very large
+exchanges that exceed the summarizer's bounded input and long histories
+dominated by protected text can still hit the context floor. The initial
+implementation uses independent leaf summaries and paged recall.
+
+Rollback starts by turning `enabled` off and reconstructing the affected
+Agent sessions. This removes compaction from the provider request path. The
+existing session backend continues to own the originals.
+
 ## Whole-turn retention
 
 `history_trim::trim_to_recent_turns` enforces the token budget.

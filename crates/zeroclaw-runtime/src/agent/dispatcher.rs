@@ -32,7 +32,7 @@ pub trait ToolDispatcher: Send + Sync {
 pub struct XmlToolDispatcher;
 
 impl XmlToolDispatcher {
-    fn parse_xml_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
+    pub(crate) fn parse_xml_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         // Strip `<think>...</think>` blocks before parsing tool calls.
         // Qwen and other reasoning models may embed chain-of-thought inline.
         let cleaned = zeroclaw_tool_call_parser::strip_think_tags(response);

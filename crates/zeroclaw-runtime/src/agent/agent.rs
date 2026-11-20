@@ -657,6 +657,7 @@ pub struct Agent {
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
     /// Route-local provider replay state; canonical history remains untouched.
     provider_image_state: crate::agent::turn::ProviderImageState,
+    context_summaries: super::turn::compaction::SummaryCache,
     provider_switch_config: Option<ProviderSwitchConfig>,
     /// The capabilities a capability-built agent was constructed from, and
     /// the principal it resolves for. A model switch asks their provider
@@ -1469,6 +1470,7 @@ impl AgentBuilder {
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
             provider_image_state: crate::agent::turn::ProviderImageState::default(),
+            context_summaries: Default::default(),
             config_generation: self.config_generation,
             provider_switch_config: self.provider_switch_config,
             supplied_capabilities: self.supplied_capabilities,
@@ -1597,6 +1599,44 @@ impl Agent {
 
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
+    }
+
+    /// Bind the current session's existing transcript backend to the
+    /// compactor. The caller already owns this session and its turn permit.
+    pub fn bind_compaction_session(
+        &mut self,
+        backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+        key: String,
+    ) {
+        if self.context_compaction_enabled() && self.context_summaries.bind(backend, key).is_err() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Could not restore context summaries; originals remain available"
+            );
+        }
+    }
+
+    fn context_compaction_enabled(&self) -> bool {
+        self.full_config()
+            .and_then(|config| {
+                super::turn::compaction::Settings::for_agent(config, &self.agent_alias)
+            })
+            .is_some()
+    }
+
+    /// Export the original history for session backends that use flat records.
+    /// Opted-in sessions retain the native call/result carriers for restore and recall.
+    pub fn durable_session_messages(&self) -> Vec<ChatMessage> {
+        if self.context_compaction_enabled() {
+            NativeToolDispatcher
+                .to_provider_messages(&self.history)
+                .into_iter()
+                .filter(|msg| !msg.is_system())
+                .collect()
+        } else {
+            zeroclaw_providers::durable_chat_messages(&self.history)
+        }
     }
 
     /// Return the owner-maintained structured history for native persistence.
@@ -1864,6 +1904,7 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.context_summaries.clear();
         self.history_has_trim_breadcrumb = false;
     }
 
@@ -2484,10 +2525,29 @@ impl Agent {
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(sys)));
         }
-        for msg in messages {
-            if msg.role != "system" {
-                self.history.push(ConversationMessage::Chat(msg.clone()));
+        if self.context_compaction_enabled() {
+            if self.context_summaries.restore().is_err() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Could not restore context summaries; originals remain available"
+                );
             }
+            self.history.extend(
+                Self::replay_loop_messages(messages, None)
+                    .into_iter()
+                    .filter(
+                        |msg| !matches!(msg, ConversationMessage::Chat(chat) if chat.is_system()),
+                    ),
+            );
+        } else {
+            self.history.extend(
+                messages
+                    .iter()
+                    .filter(|msg| !msg.is_system())
+                    .cloned()
+                    .map(ConversationMessage::Chat),
+            );
         }
         self.trim_history(None)
             .map(HistoryTrimNotice::into_turn_event)
@@ -4680,6 +4740,7 @@ impl Agent {
                         }),
                     },
                     Some(&repetition_guard),
+                    &self.context_summaries,
                 )),
             ),
         );
@@ -5341,6 +5402,7 @@ impl Agent {
                         initial_ingress_subject,
                         carried_reported_usage.take(),
                         Some(&repetition_guard),
+                        &self.context_summaries,
                     )),
                 ),
             );

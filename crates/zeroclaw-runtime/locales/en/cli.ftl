@@ -1765,3 +1765,10 @@ turn-repeated-success-advisory = The same tool call returned the same successful
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+
+# Active-turn context compaction
+history-recall-source = Supply the source ID printed in the historical summary.
+history-recall-unavailable = That source or row is unavailable in the current request.
+turn-compaction-floor = Context compaction could not make room for the next model request and its reply. The completed work remains in conversation history.
+turn-compaction-failed = The local summarizer could not produce a usable summary. Continuing with the available original context where it fits.
+turn-compaction-config = Context compaction needs valid limits and a dedicated loopback llama.cpp summary provider with a configured model and context window.

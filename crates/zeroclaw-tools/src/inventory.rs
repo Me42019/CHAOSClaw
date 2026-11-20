@@ -285,6 +285,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
     },
     // Sessions.
     BuiltinToolSpec {
+        name: "history_recall",
+        tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
+    },
+    BuiltinToolSpec {
         name: "sessions_current",
         tier: ToolTier::Host,
         compilation: BuiltinToolCompilation::Always,

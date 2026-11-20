@@ -115,7 +115,7 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
 /// Try to extract a `tool_call_id` from a tool-role message's JSON content.
 /// Tool messages are stored as JSON like:
 /// `{"content": "...", "tool_call_id": "toolu_01Abc..."}`
-fn extract_tool_call_id(content: &str) -> Option<String> {
+pub(crate) fn extract_tool_call_id(content: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(content).ok()?;
     value
         .get("tool_call_id")

@@ -50,7 +50,7 @@ pub(crate) fn is_sop_step_prompt(content: &str) -> bool {
 /// trimming keeps its own boundary rule; retention must not let a row the
 /// loop itself appended mid-turn push the running turn's tool rows out of the
 /// retained window.
-fn opens_retention_turn(msg: &ChatMessage) -> bool {
+pub(crate) fn opens_retention_turn(msg: &ChatMessage) -> bool {
     is_turn_boundary(msg)
         && !RUNTIME_FEEDBACK_PREFIXES
             .iter()
