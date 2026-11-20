@@ -56,10 +56,10 @@ pub(crate) fn quote_untrusted(text: &str) -> String {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadArgs {
-    artifact_id: String,
-    offset: u64,
-    length: usize,
+pub(crate) struct ReadArgs {
+    pub(crate) artifact_id: String,
+    pub(crate) offset: u64,
+    pub(crate) length: usize,
 }
 
 zeroclaw_api::tool_attribution!(ToolOutputRead, zeroclaw_api::attribution::ToolKind::Plugin);

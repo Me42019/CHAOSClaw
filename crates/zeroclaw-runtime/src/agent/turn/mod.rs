@@ -12,6 +12,7 @@ pub(crate) mod history_window;
 pub(crate) mod knobs;
 pub(crate) mod max_iter;
 pub(crate) mod media_degrade;
+mod observation_mask;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
@@ -1814,6 +1815,7 @@ async fn run_tool_call_loop_impl<'a>(
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
+    let mut observation_mask = observation_mask::ObservationMask::default();
 
     let ingress_policy_cfg = IngressPolicy::default();
 
@@ -2087,6 +2089,7 @@ async fn run_tool_call_loop_impl<'a>(
                 let msg = ChatMessage::user(steering_input.into_text());
                 has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
                 turn_state.push_dual(msg);
+                observation_mask.clear();
             }
         }
 
@@ -2157,7 +2160,9 @@ async fn run_tool_call_loop_impl<'a>(
             }
         }
 
-        preflight_history_maintenance(turn_state.history);
+        if preflight_history_maintenance(turn_state.history) {
+            observation_mask.clear();
+        }
 
         // Check if model switch was requested via model_switch tool before
         // constructing this iteration's provider route.
@@ -2380,6 +2385,40 @@ async fn run_tool_call_loop_impl<'a>(
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
         let tool_specs = iteration_tool_specs.request_tool_specs();
         let use_native_tools = iteration_tool_specs.use_native_tools;
+        // Existing tool visibility and approval are the authority for
+        // recovery. A rewritten hook population has no reliable source-row map.
+        let (masked_observations, observation_tokens_saved) = if let Some(store) =
+            tool_output_store.as_ref().filter(|_| {
+                !hook_structural_mutation
+                    && (use_native_tools || !strict_tool_parsing)
+                    && !excluded_tools
+                        .iter()
+                        .any(|tool| ToolOutputRead::matches(tool))
+                    && crate::agent::tool_execution::find_tool(tools_registry, ToolOutputRead::NAME)
+                        .is_some_and(|tool| {
+                            tool.tool_provenance()
+                                == zeroclaw_api::attribution::ToolProvenance::Native
+                        })
+                    && tool_specs
+                        .iter()
+                        .any(|spec| ToolOutputRead::matches(&spec.name))
+                    && approval.is_none_or(|mgr| {
+                        mgr.approval_requirement(ToolOutputRead::NAME)
+                            != crate::approval::ApprovalRequirement::Prompt
+                    })
+            }) {
+            Box::pin(observation_mask.apply(
+                turn_state.history,
+                &mut provider_request_messages,
+                &prepared_source_rows,
+                store,
+                turn_id,
+                trim_budget,
+            ))
+            .await
+        } else {
+            (0, 0)
+        };
         let builtin_prompt_section = activated_tools.and_then(|state| {
             let state = state.lock().unwrap_or_else(|error| error.into_inner());
             state.has_deferred_builtin_schemas().then(|| {
@@ -2487,6 +2526,22 @@ async fn run_tool_call_loop_impl<'a>(
         let mut reported_population_estimated =
             crate::agent::history::estimate_history_tokens(&provider_request_messages)
                 + tool_schema_tokens;
+        if masked_observations > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "trace_id": turn_id,
+                        "iteration": iteration + 1,
+                        "masked_observations": masked_observations,
+                        "estimated_tokens_before": reported_population_estimated
+                            .saturating_add(observation_tokens_saved),
+                        "estimated_tokens_after": reported_population_estimated,
+                    })),
+                "active_turn_observations_masked"
+            );
+        }
 
         // Reuse a report only for the route that produced it. A model switch
         // must not inherit another model's token calibration. Keep the existing
@@ -3620,6 +3675,28 @@ async fn run_tool_call_loop_impl<'a>(
             repetition::RepetitionDisposition::default()
         };
 
+        let observation = output_scope.and_then(|_| {
+            let ([completed_call], [completed_outcome]) = (
+                executed_completed_calls.as_slice(),
+                executed_completed_outcomes.as_slice(),
+            ) else {
+                return None;
+            };
+            let tool =
+                crate::agent::tool_execution::find_tool(tools_registry, &completed_call.name)?;
+            if tool.tool_provenance() != zeroclaw_api::attribution::ToolProvenance::Native {
+                return None;
+            }
+            observation_mask::Observation::from_completion(
+                iteration,
+                &tool_calls,
+                &native_tool_calls,
+                use_native_tools,
+                &executed_completed_calls,
+                Some(&completed_outcome.outcome),
+                max_tool_result_chars,
+            )
+        });
         record_executed_outcomes(
             &ctx,
             &executed_completed_indices,
@@ -3735,6 +3812,7 @@ async fn run_tool_call_loop_impl<'a>(
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
         }
+        observation_mask.record_round(iteration, turn_state.history, observation);
 
         if let Some(key) = repetition_disposition.message_key {
             if cancellation_token
@@ -3819,6 +3897,7 @@ async fn run_tool_call_loop_impl<'a>(
             ))
             .await?;
             turn_state.mark_all_synced();
+            observation_mask.clear();
         }
 
         pending_reported_usage = reported_input_tokens.map(|reported| ReportedRequestUsage {

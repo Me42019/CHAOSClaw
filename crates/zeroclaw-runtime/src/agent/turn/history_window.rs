@@ -6,7 +6,8 @@
 use crate::agent::history::normalize_system_messages;
 use zeroclaw_providers::ChatMessage;
 
-pub(crate) fn preflight_history_maintenance(history: &mut Vec<ChatMessage>) {
+/// Return whether any non-system rows were removed.
+pub(crate) fn preflight_history_maintenance(history: &mut Vec<ChatMessage>) -> bool {
     // Remove orphaned tool-role messages whose assistant (tool_calls)
     // counterpart was dropped by turn-boundary trimming or session history
     // reloading. Without this, model_providers like MiniMax reject the
@@ -41,6 +42,7 @@ pub(crate) fn preflight_history_maintenance(history: &mut Vec<ChatMessage>) {
         );
     }
     normalize_system_messages(history);
+    !pruned_in_loop.is_empty()
 }
 
 #[cfg(test)]
