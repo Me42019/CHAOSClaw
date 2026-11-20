@@ -24,9 +24,13 @@ pub(crate) mod results_collect;
 pub(crate) mod steering;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
+pub(crate) mod tool_output_store;
+#[cfg(all(test, unix))]
+mod tool_output_tests;
 pub(crate) mod tool_specs;
 pub(crate) mod vision_route;
 
+use crate::tools::tool_output_read::{TOOL_OUTPUT_READ_SCOPE, ToolOutputRead};
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{
@@ -79,6 +83,7 @@ pub use steering::{
 };
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
+use tool_output_store::ToolOutputStore;
 #[cfg(test)]
 use tool_specs::IterationToolSpecs;
 pub(crate) use tool_specs::build_iteration_tool_specs;
@@ -1636,7 +1641,7 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard)
+    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard, None)
 }
 
 /// Non-streamed Agent turns own the guard without steering ingress.
@@ -1645,13 +1650,22 @@ pub(crate) fn run_tool_call_loop_with_guard<'a>(
     p: ToolLoop<'a>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, None, None, repetition_guard)
+    run_tool_call_loop_impl(p, None, None, repetition_guard, None)
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
 ) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None, None)
+    run_tool_call_loop_impl(p, None, None, None, None)
+}
+
+/// CLI transcripts are identified by their state file, independent of the
+/// task-local channel/RPC session key consumed by other tools.
+pub(crate) fn run_tool_call_loop_with_transcript_session<'a>(
+    p: ToolLoop<'a>,
+    transcript_session: Option<&'a str>,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    run_tool_call_loop_impl(p, None, None, None, transcript_session)
 }
 
 async fn run_tool_call_loop_impl<'a>(
@@ -1659,6 +1673,7 @@ async fn run_tool_call_loop_impl<'a>(
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+    transcript_session: Option<&'a str>,
 ) -> Result<String> {
     let model_switch_state = p
         .exec
@@ -1751,6 +1766,50 @@ async fn run_tool_call_loop_impl<'a>(
                 .ok()
         })
         .unwrap_or(0);
+
+    // The session key is stamped by the caller that owns session history.
+    // Recall scopes can include other sessions and must never grant access.
+    let tool_output_store = (|| {
+        use zeroclaw_api::ingress::TurnOrigin;
+        if parent_agent_alias.is_some()
+            || !matches!(
+                ingress.origin,
+                TurnOrigin::Interactive | TurnOrigin::Channel | TurnOrigin::AgentDirect
+            )
+            || !tools_registry
+                .iter()
+                .any(|tool| tool.name() == ToolOutputRead::NAME)
+        {
+            return None;
+        }
+        let stamped_session = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let session = transcript_session.or(stamped_session.as_deref())?;
+        ToolOutputStore::new(
+            config?.install_root_dir(),
+            agent_alias?,
+            channel_name,
+            session,
+            capability_binding
+                .and_then(|binding| binding.principal.as_ref())
+                .map_or("", |principal| principal.0.as_str()),
+        )
+    })();
+
+    let unavailable_tool_exclusions = (tool_output_store.is_none()
+        && tools_registry
+            .iter()
+            .any(|tool| tool.name() == ToolOutputRead::NAME))
+    .then(|| {
+        let mut excluded = excluded_tools.to_vec();
+        excluded.push(ToolOutputRead::NAME.to_owned());
+        excluded
+    });
+    let excluded_tools = unavailable_tool_exclusions
+        .as_deref()
+        .unwrap_or(excluded_tools);
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
@@ -3487,6 +3546,12 @@ async fn run_tool_call_loop_impl<'a>(
                     .await
                 }
             });
+        let output_scope = tool_output_store.as_ref().filter(|_| {
+            !excluded_tools
+                .iter()
+                .any(|name| ToolOutputRead::matches(name))
+        });
+        let execution = TOOL_OUTPUT_READ_SCOPE.scope(output_scope.cloned(), execution);
         let execution = scope_model_switch_provider_allowlist(
             knobs.provider_attempt_allowlist.clone(),
             execution,
@@ -3642,7 +3707,9 @@ async fn run_tool_call_loop_impl<'a>(
             active_model,
             iteration,
             turn_id,
-        )?;
+            output_scope,
+        )
+        .await?;
 
         if !cancelled_mid_batch && repetition_guard.is_none() {
             check_identical_output_abort(

@@ -102,6 +102,20 @@ fn short_sha256_prefix(bytes: &[u8]) -> String {
     hex::encode(&Sha256::digest(bytes)[..8])
 }
 
+/// Even opt-in request diagnostics omit pages read from a private artifact.
+fn capture_message_text(message: &ChatMessage) -> &str {
+    use crate::tools::tool_output_read::PAGE_PREFIX;
+
+    let content = message.content.as_str();
+    let tool_result = message.role == "tool"
+        || (message.role == "user" && zeroclaw_api::tool_carrier::is_prompt_tool_carrier(content));
+    if tool_result && content.contains(PAGE_PREFIX) {
+        "[Private artifact page omitted]"
+    } else {
+        content
+    }
+}
+
 pub(crate) async fn announce_llm_request(
     ctx: &TurnCtx<'_>,
     request_messages: &[ChatMessage],
@@ -161,7 +175,7 @@ pub(crate) async fn announce_llm_request(
             let rendered: Vec<::serde_json::Value> = request_messages
                 .iter()
                 .map(|m| {
-                    ::serde_json::json!({"role": m.role.as_str(), "content": m.content.as_str()})
+                    ::serde_json::json!({"role": m.role.as_str(), "content": capture_message_text(m)})
                 })
                 .collect();
             let serialized = ::serde_json::to_string(&rendered).unwrap_or_default();
@@ -714,6 +728,26 @@ mod payload_capture_tests {
     /// `ModelProvider`; `announce_llm_request` never calls it (it only opens
     /// `attribution_span!` over the provider), so a trivial reply is fine.
     struct StubProvider;
+
+    #[test]
+    fn artifact_pages_are_omitted_from_diagnostic_capture_in_both_carriers() {
+        use super::capture_message_text;
+
+        let prefix = crate::tools::tool_output_read::PAGE_PREFIX;
+        let page = format!("{prefix}\nprivate test payload");
+        let native = ChatMessage::tool(serde_json::json!({"content":page}).to_string());
+        let prompt = ChatMessage::user(format!(
+            "[Tool results]\n<tool_result name=\"tool_output_read\">\n{page}\n</tool_result>"
+        ));
+        for message in [native, prompt] {
+            assert_eq!(
+                capture_message_text(&message),
+                "[Private artifact page omitted]"
+            );
+        }
+        let ordinary = ChatMessage::tool("ordinary output");
+        assert_eq!(capture_message_text(&ordinary), "ordinary output");
+    }
 
     #[async_trait]
     impl ModelProvider for StubProvider {

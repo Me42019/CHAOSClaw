@@ -172,6 +172,7 @@ pub use deliver_file::{
     DeliverFileTool, MAX_DELIVER_FILE_BYTES, attachment_deliver_uri,
     read_delivered_artifact_bounded,
 };
+pub(crate) mod tool_output_read;
 pub use file_read::FileReadTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
@@ -2429,6 +2430,15 @@ fn all_tools_with_runtime_on_thread(
             security.clone(),
         ))
     );
+    if cfg!(unix) {
+        register_tool!(
+            tool_output_read::ToolOutputRead::NAME,
+            Arc::new(RateLimitedTool::new(
+                tool_output_read::ToolOutputRead,
+                security.clone()
+            ))
+        );
+    }
     register_tool!(
         "deliver_file",
         Arc::new(RateLimitedTool::new(

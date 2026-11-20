@@ -258,6 +258,22 @@ impl LoopDetector {
             return None;
         }
 
+        // Producing artifacts and reading distinct pages of them is progress.
+        // Repeated pages still go through the ordinary pattern detectors.
+        if let Some(read_tool) = [a_name, b_name]
+            .into_iter()
+            .find(|name| crate::tools::tool_output_read::ToolOutputRead::matches(name))
+            && tail
+                .iter()
+                .filter(|record| &record.name == read_tool)
+                .map(|record| record.args_hash)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == MIN_CYCLES
+        {
+            return None;
+        }
+
         let is_ping_pong = tail.iter().enumerate().all(|(i, r)| {
             if i % 2 == 0 {
                 &r.name == a_name
@@ -376,6 +392,21 @@ mod tests {
     }
 
     // ── Exact repeat tests ───────────────────────────────────────
+
+    #[test]
+    fn repeated_artifact_page_still_trips_the_alternation_guard() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut result = LoopDetectionResult::Ok;
+        for i in 0..6 {
+            detector.record("fixture", &serde_json::json!({"index": i}), &i.to_string());
+            result = detector.record(
+                "tool_output_read",
+                &serde_json::json!({"artifact_id": "same", "offset": 0, "length": 512}),
+                "same page",
+            );
+        }
+        assert!(matches!(result, LoopDetectionResult::Break(_)));
+    }
 
     #[test]
     fn exact_repeat_warning_at_threshold() {

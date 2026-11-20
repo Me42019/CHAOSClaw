@@ -2219,6 +2219,17 @@ async fn run_inner(
             }
         });
 
+        // Use the transcript's actual path as the CLI session identity. The
+        // memory scope above is sanitized and can merge distinct path spellings.
+        let transcript_session_key = session_state_file.as_deref().and_then(|path| {
+            let absolute = std::path::absolute(path).ok()?;
+            use sha2::{Digest, Sha256};
+            Some(format!(
+                "cli:{:x}",
+                Sha256::digest(absolute.as_os_str().as_encoded_bytes())
+            ))
+        });
+
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
         let cost_tracking_context =
             crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
@@ -2446,7 +2457,7 @@ async fn run_inner(
                         thinking_params.native_thinking,
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
-                            run_tool_call_loop(ToolLoop {
+                            super::turn::run_tool_call_loop_with_transcript_session(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
@@ -2527,7 +2538,7 @@ async fn run_inner(
                                     Some(&bound_capabilities),
                                     &mem,
                                 )),
-                            }),
+                            }, transcript_session_key.as_deref()),
                         ),
                     )
                     .await
@@ -3100,7 +3111,7 @@ async fn run_inner(
                             thinking_params.native_thinking,
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
-                                run_tool_call_loop(ToolLoop {
+                                super::turn::run_tool_call_loop_with_transcript_session(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
@@ -3191,7 +3202,7 @@ async fn run_inner(
                                         Some(&bound_capabilities),
                                         &mem,
                                     )),
-                                }),
+                                }, transcript_session_key.as_deref()),
                             ),
                         )
                         .await
