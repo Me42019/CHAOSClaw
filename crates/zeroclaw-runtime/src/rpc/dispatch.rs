@@ -5308,6 +5308,7 @@ impl RpcDispatcher {
                 crate::rpc::types::ChatMode::Chat => {
                     if let Some(ref backend) = self.ctx.session_backend {
                         let session_key = format!("rpc_{session_id}");
+                        agent.bind_compaction_session(Arc::clone(backend), session_key.clone());
                         let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
                         // Fail closed: an unreadable transcript must not become
                         // an empty history that a later turn authoritatively
@@ -5361,9 +5362,7 @@ impl RpcDispatcher {
                                     // agent and the durable session
                                     // disagreeing.
                                     if seed_event.is_some() {
-                                        let durable = zeroclaw_providers::durable_chat_messages(
-                                            agent.history(),
-                                        );
+                                        let durable = agent.durable_session_messages();
                                         if !replace_rpc_chat_conversation_state(
                                             backend.as_ref(),
                                             &session_id,
@@ -7469,7 +7468,7 @@ impl RpcDispatcher {
                     // delta on top of a transcript the agent's loop may have
                     // already trimmed underneath it.
                     let agent = agent.lock().await;
-                    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+                    let durable = agent.durable_session_messages();
                     replace_rpc_chat_conversation_state(
                         backend.as_ref(),
                         sid,

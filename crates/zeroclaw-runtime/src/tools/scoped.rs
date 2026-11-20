@@ -1476,6 +1476,7 @@ impl ScopedToolRegistry {
             "file_edit",
             "memory_recall",
             "memory_store",
+            crate::agent::turn::compaction::HistoryRecall::NAME,
         ];
         let builtin_deferral = !list_deferred_mcp_specs
             && config

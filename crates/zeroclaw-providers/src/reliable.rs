@@ -326,6 +326,25 @@ pub fn take_last_provider_fallback_attribution() -> Option<ProviderFallbackAttri
         .flatten()
 }
 
+tokio::task_local! {
+    static PRESERVE_CONTEXT_PROJECTION: bool;
+}
+
+/// Let the turn owner handle context overflow when it has already admitted
+/// a source-linked projection. A retry must preserve that projection.
+pub async fn scope_preserve_context_projection<F: std::future::Future>(
+    preserve: bool,
+    future: F,
+) -> F::Output {
+    PRESERVE_CONTEXT_PROJECTION.scope(preserve, future).await
+}
+
+fn preserve_context_projection() -> bool {
+    PRESERVE_CONTEXT_PROJECTION
+        .try_with(|preserve| *preserve)
+        .unwrap_or(false)
+}
+
 /// Take whether Reliable shortened the provider-visible transcript while
 /// recovering the current request from a context-window error.
 ///
@@ -1559,6 +1578,9 @@ fn is_context_turn_boundary(message: &ChatMessage) -> bool {
 }
 
 fn context_truncation_limit(messages: &[ChatMessage]) -> &'static str {
+    if preserve_context_projection() {
+        return "the turn's context projection is protected";
+    }
     if messages.iter().any(is_context_turn_boundary) {
         "only one complete user turn remains"
     } else {
@@ -1571,6 +1593,9 @@ fn context_truncation_limit(messages: &[ChatMessage]) -> &'static str {
 /// most recent complete turn and preserving tool calls with all of their
 /// results.
 fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
+    if preserve_context_projection() {
+        return 0;
+    }
     let non_system: Vec<usize> = messages
         .iter()
         .enumerate()

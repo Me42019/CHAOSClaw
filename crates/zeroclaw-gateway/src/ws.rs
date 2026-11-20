@@ -873,6 +873,9 @@ async fn handle_socket(
     // Read the generation before seeding so a write landing in between shows
     // up as a changed generation on the next turn, which is the safe direction.
     let connect_generation = state.session_queue.generation(&session_key);
+    if let Some(backend) = &state.session_backend {
+        agent.bind_compaction_session(Arc::clone(backend), session_key.clone());
+    }
     let restored = match restore_agent_history(
         state.session_backend.as_deref(),
         &mut agent,
@@ -1438,7 +1441,7 @@ fn persist_agent_conversation_state(
     session_key: &str,
     agent: &zeroclaw_runtime::agent::Agent,
 ) -> bool {
-    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+    let durable = agent.durable_session_messages();
     replace_conversation_state_unless_deleted(
         backend,
         session_key,
@@ -1464,7 +1467,7 @@ fn note_own_transcript_write(
 ) -> PersistedWatermark {
     PersistedWatermark {
         generation: queue.advance_generation(session_key),
-        len: zeroclaw_providers::durable_chat_messages(agent.history()).len(),
+        len: agent.durable_session_messages().len(),
     }
 }
 
@@ -2562,11 +2565,11 @@ async fn process_chat_message(
                 } else {
                     format!("{accumulated_text}\n\n{marker}")
                 };
-                let mut d = zeroclaw_providers::durable_chat_messages(agent.history());
+                let mut d = agent.durable_session_messages();
                 d.push(zeroclaw_providers::ChatMessage::assistant(&truncated));
                 d
             } else {
-                zeroclaw_providers::durable_chat_messages(agent.history())
+                agent.durable_session_messages()
             };
             let crumb = agent.history_has_trim_breadcrumb();
             replace_conversation_state_unless_deleted(

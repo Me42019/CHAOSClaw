@@ -68,7 +68,7 @@ async fn emit_summary_attempt_usage(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn finish_after_max_iterations(
+pub(super) async fn finish_after_max_iterations(
     injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
@@ -96,7 +96,14 @@ pub(crate) async fn finish_after_max_iterations(
     reported_usage: Option<super::ReportedRequestUsage>,
     observer: &dyn crate::observability::Observer,
     vision_source: Option<super::VisionProviderSource<'_>>,
+    compaction: Option<(
+        &Config,
+        &super::compaction::SummaryCache,
+        &super::compaction::Settings<'_>,
+        &mut super::compaction::TurnCompaction,
+    )>,
 ) -> Result<String> {
+    let protect_projection = compaction.is_some();
     let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
         WARN,
@@ -190,14 +197,14 @@ pub(crate) async fn finish_after_max_iterations(
         let summary_future = async {
             // Exclude the synthetic prompt so trailing tool-result images
             // remain in the latest run and receive normal image validation.
-            let mut messages = super::vision_route::prepare_messages_for_iteration(
+            let (prepared, sources) = super::vision_route::prepare_messages_with_source_rows(
                 history,
                 multimodal_config,
                 degrade_strip_images,
                 image_cache.as_deref_mut(),
             )
-            .await?
-            .messages;
+            .await?;
+            let mut messages = prepared.messages;
             let prepared_message_count = messages.len();
             messages.push(summary_prompt_mirror.clone());
             let pre_hook_messages = messages.clone();
@@ -245,119 +252,156 @@ pub(crate) async fn finish_after_max_iterations(
                 );
                 messages.extend(transient_suffix);
             }
-            let tokens_before =
-                token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
-            let mut dropped_messages = 0;
-            let mut dropped_turns = 0;
-            loop {
-                let tokens =
-                    token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
-                let mut trim = super::surface_oversized_dispatch_if_needed(
-                    injected_memory_preamble,
-                    history,
-                    crumb_present,
-                    tokens,
-                    trim_budget,
+            if let Some((config, cache, settings, state)) = compaction {
+                let (target, hard) = settings.limits(
+                    config,
+                    provider_name,
+                    &selected_model,
+                    context_limits.model_context_window,
                 );
-                dropped_messages += trim.dropped_messages;
-                if trim.outcome == super::PreDispatchOutcome::Trimmed {
-                    // Rebuild only an unchanged prefix plus a transient suffix.
-                    // Arbitrary hook rewrites cannot be replayed without invoking the hook twice.
-                    if !suffix_only {
-                        anyhow::bail!(crate::i18n::get_required_cli_string(
-                            "turn-context-hook-mutation-unsafe-error",
-                        ));
-                    }
-                    dropped_turns += 1;
-                    messages = super::vision_route::prepare_messages_for_iteration(
-                        history,
-                        multimodal_config,
-                        degrade_strip_images,
-                        image_cache.as_deref_mut(),
-                    )
-                    .await?
-                    .messages;
-                    messages = super::suppress_quarantined_provider_images(
-                        &messages,
-                        &quarantined_image_ids,
-                        false,
-                    );
-                    messages.push(summary_prompt_mirror.clone());
-                    messages.extend(hook_suffix.iter().cloned());
-                    continue;
-                }
-                trim.dropped_messages = dropped_messages;
-                super::record_dispatch_trim(
-                    (provider_name, &selected_model),
-                    &trim,
-                    dropped_turns,
-                    trim_budget,
-                    tokens_before,
-                    tokens,
-                    token_counter.source(),
-                );
-                let floor = tokens > context_limits.model_context_window as u64;
-                let event_budget = if floor {
-                    context_limits.model_context_window
+                let estimated = if suffix_only {
+                    state
+                        .prepare(
+                            cache,
+                            settings,
+                            super::compaction::Request {
+                                history,
+                                sources: &sources,
+                                messages: &mut messages,
+                                schema_tokens: 0,
+                                counter: &token_counter,
+                                trigger: target,
+                                cancel: cancellation_token,
+                                turn: turn_id,
+                                memory: injected_memory_preamble.as_ref(),
+                                breadcrumb: *crumb_present,
+                            },
+                        )
+                        .await?
                 } else {
-                    trim_budget
+                    crate::agent::history::estimate_history_tokens(&messages)
                 };
-                if dropped_messages > 0 || floor {
-                    let source = token_counter.source();
-                    let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
-                    if let Some(tx) = event_tx {
-                        let _ = tx
-                            .send(TurnEvent::HistoryTrimmed {
+                if token_counter.count(estimated) > hard {
+                    anyhow::bail!(crate::i18n::get_required_cli_string(
+                        "turn-compaction-floor"
+                    ));
+                }
+            } else {
+                let tokens_before =
+                    token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+                let mut dropped_messages = 0;
+                let mut dropped_turns = 0;
+                loop {
+                    let tokens = token_counter
+                        .count(crate::agent::history::estimate_history_tokens(&messages));
+                    let mut trim = super::surface_oversized_dispatch_if_needed(
+                        injected_memory_preamble,
+                        history,
+                        crumb_present,
+                        tokens,
+                        trim_budget,
+                    );
+                    dropped_messages += trim.dropped_messages;
+                    if trim.outcome == super::PreDispatchOutcome::Trimmed {
+                        // Rebuild only an unchanged prefix plus a transient suffix.
+                        // Arbitrary hook rewrites cannot be replayed without invoking the hook twice.
+                        if !suffix_only {
+                            anyhow::bail!(crate::i18n::get_required_cli_string(
+                                "turn-context-hook-mutation-unsafe-error",
+                            ));
+                        }
+                        dropped_turns += 1;
+                        messages = super::vision_route::prepare_messages_for_iteration(
+                            history,
+                            multimodal_config,
+                            degrade_strip_images,
+                            image_cache.as_deref_mut(),
+                        )
+                        .await?
+                        .messages;
+                        messages = super::suppress_quarantined_provider_images(
+                            &messages,
+                            &quarantined_image_ids,
+                            false,
+                        );
+                        messages.push(summary_prompt_mirror.clone());
+                        messages.extend(hook_suffix.iter().cloned());
+                        continue;
+                    }
+                    trim.dropped_messages = dropped_messages;
+                    super::record_dispatch_trim(
+                        (provider_name, &selected_model),
+                        &trim,
+                        dropped_turns,
+                        trim_budget,
+                        tokens_before,
+                        tokens,
+                        token_counter.source(),
+                    );
+                    let floor = tokens > context_limits.model_context_window as u64;
+                    let event_budget = if floor {
+                        context_limits.model_context_window
+                    } else {
+                        trim_budget
+                    };
+                    if dropped_messages > 0 || floor {
+                        let source = token_counter.source();
+                        let reason =
+                            crate::i18n::get_required_cli_string("history-trim-reason-budget");
+                        if let Some(tx) = event_tx {
+                            let _ = tx
+                                .send(TurnEvent::HistoryTrimmed {
+                                    dropped_messages,
+                                    dropped_turns,
+                                    kept_turns: trim.kept_turns,
+                                    reason: reason.clone(),
+                                    token_budget: Some(event_budget as u64),
+                                    tokens_before: Some(tokens_before),
+                                    tokens_after: Some(tokens),
+                                    tokens_before_source: Some(source),
+                                    tokens_after_source: Some(source),
+                                    unsatisfiable_floor: floor.then_some(true),
+                                    retained_context: Some(super::retained_context_snapshot(
+                                        injected_memory_preamble,
+                                        history,
+                                        *crumb_present,
+                                    )),
+                                })
+                                .await;
+                        }
+                        observer.record_event(
+                            &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
                                 dropped_messages,
-                                dropped_turns,
                                 kept_turns: trim.kept_turns,
-                                reason: reason.clone(),
+                                reason,
+                                channel: None,
+                                agent_alias: None,
+                                turn_id: None,
                                 token_budget: Some(event_budget as u64),
                                 tokens_before: Some(tokens_before),
                                 tokens_after: Some(tokens),
                                 tokens_before_source: Some(source),
                                 tokens_after_source: Some(source),
                                 unsatisfiable_floor: floor.then_some(true),
-                                retained_context: Some(super::retained_context_snapshot(
-                                    injected_memory_preamble,
-                                    history,
-                                    *crumb_present,
-                                )),
-                            })
-                            .await;
+                            },
+                        );
                     }
-                    observer.record_event(
-                        &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-                            dropped_messages,
-                            kept_turns: trim.kept_turns,
-                            reason,
-                            channel: None,
-                            agent_alias: None,
-                            turn_id: None,
-                            token_budget: Some(event_budget as u64),
-                            tokens_before: Some(tokens_before),
-                            tokens_after: Some(tokens),
-                            tokens_before_source: Some(source),
-                            tokens_after_source: Some(source),
-                            unsatisfiable_floor: floor.then_some(true),
-                        },
-                    );
+                    if floor {
+                        // The summary call is tools-free, so the schemas cost nothing here.
+                        return Err(super::context_window_exceeded_error(
+                            (provider_name, &selected_model),
+                            context_limits,
+                            tokens,
+                            token_counter.source(),
+                            (
+                                crate::agent::history::estimate_history_tokens(&messages),
+                                crate::agent::history::estimate_system_floor_tokens(&messages),
+                                0,
+                            ),
+                        ));
+                    }
+                    break;
                 }
-                if floor {
-                    // The summary call is tools-free, so the schemas cost nothing here.
-                    return Err(super::context_window_exceeded_error(
-                        (provider_name, &selected_model),
-                        context_limits,
-                        tokens,
-                        token_counter.source(),
-                        (
-                            crate::agent::history::estimate_history_tokens(&messages),
-                            crate::agent::history::estimate_system_floor_tokens(&messages),
-                            0,
-                        ),
-                    ));
-                }
-                break;
             }
             let summary_request = zeroclaw_providers::ChatRequest {
                 messages: &messages,
@@ -383,9 +427,11 @@ pub(crate) async fn finish_after_max_iterations(
             // recorded no cost; through the seam it now fails closed when the turn's
             // budget is exhausted and its token usage is charged like any in-loop
             // call. Metering is a no-op when the turn is unscoped.
-            access
-                .run_model_query(summary_request, &mut summary_attempts)
-                .await
+            zeroclaw_providers::reliable::scope_preserve_context_projection(
+                protect_projection,
+                access.run_model_query(summary_request, &mut summary_attempts),
+            )
+            .await
         };
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
@@ -697,6 +743,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
             None,
         )
         .await
@@ -1066,6 +1113,7 @@ mod graceful_summary_metering_tests {
                 None,
                 &crate::observability::NoopObserver,
                 None,
+                None,
             )
             .await;
             assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1216,6 +1264,7 @@ mod graceful_summary_metering_tests {
                 None,
                 &crate::observability::NoopObserver,
                 None,
+                None,
             )
             .await
             .expect("graceful summary succeeds");
@@ -1290,6 +1339,7 @@ mod graceful_summary_metering_tests {
                 &mut crumb_present,
                 None,
                 &crate::observability::NoopObserver,
+                None,
                 None,
             )
             .await
@@ -1380,6 +1430,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1463,6 +1514,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
             None,
         )
         .await
@@ -1563,6 +1615,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1644,6 +1697,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
             None,
         )
         .await
@@ -1737,6 +1791,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1791,6 +1846,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
             None,
         )
         .await
@@ -1878,6 +1934,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
             None,
         )
         .await
@@ -1968,6 +2025,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
             None,
         )
         .await

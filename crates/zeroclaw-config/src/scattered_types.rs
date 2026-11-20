@@ -350,17 +350,16 @@ fn default_tool_result_retrim_chars() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
-    /// The runtime context compressor was removed; no runtime execution path
-    /// consumes this flag, so setting it to `true` currently has no effect.
-    /// Defaults to `false` to match actual runtime behavior;
-    /// `Config::collect_warnings` reads an explicit `true` only to report
-    /// `context_compression_unsupported`.
+    /// Enable source-linked compaction in structured Agent sessions with a
+    /// dedicated local llama.cpp summary route.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
     #[serde(default = "default_threshold_ratio")]
     pub threshold_ratio: f64,
+    /// Legacy compatibility setting. All original user instructions are protected.
     #[serde(default = "default_protect_first_n")]
     pub protect_first_n: usize,
+    /// Number of complete tool exchanges kept verbatim (minimum one).
     #[serde(default = "default_protect_last_n")]
     pub protect_last_n: usize,
     #[serde(default = "default_cc_max_passes")]

@@ -2,6 +2,7 @@
 
 pub(crate) mod approval_gate;
 pub(crate) mod call_prep;
+pub(crate) mod compaction;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
@@ -44,7 +45,7 @@ pub use execution::{
 };
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
-pub(crate) use max_iter::finish_after_max_iterations;
+use max_iter::finish_after_max_iterations;
 pub use outcome::{
     ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
     is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
@@ -1635,8 +1636,15 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+    summary_cache: &'a compaction::SummaryCache,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard)
+    run_tool_call_loop_impl(
+        p,
+        Some(subject),
+        reported_usage,
+        repetition_guard,
+        Some(summary_cache),
+    )
 }
 
 /// Non-streamed Agent turns own the guard without steering ingress.
@@ -1644,14 +1652,15 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
 pub(crate) fn run_tool_call_loop_with_guard<'a>(
     p: ToolLoop<'a>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+    summary_cache: &'a compaction::SummaryCache,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, None, None, repetition_guard)
+    run_tool_call_loop_impl(p, None, None, repetition_guard, Some(summary_cache))
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
 ) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None, None)
+    run_tool_call_loop_impl(p, None, None, None, None)
 }
 
 async fn run_tool_call_loop_impl<'a>(
@@ -1659,6 +1668,7 @@ async fn run_tool_call_loop_impl<'a>(
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+    summary_cache: Option<&'a compaction::SummaryCache>,
 ) -> Result<String> {
     let model_switch_state = p
         .exec
@@ -1752,6 +1762,22 @@ async fn run_tool_call_loop_impl<'a>(
         })
         .unwrap_or(0);
 
+    let compression = match (summary_cache, config, agent_alias) {
+        (Some(cache), Some(config), Some(alias))
+            if config
+                .runtime_profile_for_agent(alias)
+                .is_some_and(|profile| profile.context_compression.enabled) =>
+        {
+            let settings = compaction::Settings::for_agent(config, alias).ok_or_else(|| {
+                anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                    "turn-compaction-config",
+                ))
+            })?;
+            Some((config, cache, settings))
+        }
+        _ => None,
+    };
+    let mut compaction_state = compaction::TurnCompaction::default();
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
@@ -2089,6 +2115,9 @@ async fn run_tool_call_loop_impl<'a>(
                         pending_reported_usage,
                         observer,
                         turn_vision_source,
+                        compression.as_ref().map(|(config, cache, settings)| {
+                            (*config, *cache, settings, &mut compaction_state)
+                        }),
                     )
                     .await;
                     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -2183,7 +2212,11 @@ async fn run_tool_call_loop_impl<'a>(
         // (channel cache, ACP transcript, CLI session file) keep every row.
         let collapsed = crate::agent::history_trim::collapse_tool_context_older_than(
             turn_state.history,
-            keep_tool_context_turns,
+            if compression.is_some() {
+                usize::MAX
+            } else {
+                keep_tool_context_turns
+            },
             turn_state.crumb_present,
             &known_tool_names,
         );
@@ -2305,7 +2338,11 @@ async fn run_tool_call_loop_impl<'a>(
         let context_token_budget = active_context_limits.context_token_budget;
         let model_context_window = active_context_limits.model_context_window;
         // Zero disables proactive trimming, but model capacity still applies.
-        let trim_budget = dispatch_trim_budget(active_context_limits);
+        let trim_budget = if compression.is_some() {
+            usize::MAX
+        } else {
+            dispatch_trim_budget(active_context_limits)
+        };
         let ctx = base_ctx.for_route(
             active_model_provider_name,
             provider_request_model,
@@ -2439,6 +2476,53 @@ async fn run_tool_call_loop_impl<'a>(
         );
         let dispatch_tokens = |estimated| token_counter.count(estimated);
         let dispatch_token_source = token_counter.source();
+
+        compaction_state.recall.clear();
+        if let Some((config, cache, settings)) = &compression {
+            let (target, hard_limit) = settings.limits(
+                config,
+                active_model_provider_name,
+                provider_request_model,
+                model_context_window,
+            );
+            // Structural hook rewrites cannot be mapped back to the source rows.
+            // Preserve them verbatim and apply the hard guard to their actual size.
+            if !hook_structural_mutation
+                && iteration_tool_specs
+                    .known_tool_names
+                    .contains(compaction::HistoryRecall::NAME)
+            {
+                enforce_tool_loop_budget()?;
+                let previously_failed = compaction_state.failed;
+                reported_population_estimated = Box::pin(compaction_state.prepare(
+                    cache,
+                    settings,
+                    compaction::Request {
+                        history: turn_state.history,
+                        sources: &prepared_source_rows,
+                        messages: &mut provider_request_messages,
+                        schema_tokens: tool_schema_tokens,
+                        counter: &token_counter,
+                        trigger: target,
+                        cancel: cancellation_token.as_ref(),
+                        turn: turn_id,
+                        memory: injected_memory_preamble.as_ref(),
+                        breadcrumb: turn_state.crumb_present,
+                    },
+                ))
+                .await?;
+                if !previously_failed && compaction_state.failed {
+                    let notice = crate::i18n::get_required_cli_string("turn-compaction-failed");
+                    events::emit_posthoc_turn_chunk(event_tx.as_ref(), &format!("{notice}\n\n"))
+                        .await;
+                }
+            }
+            if dispatch_tokens(reported_population_estimated) > hard_limit {
+                return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                    "turn-compaction-floor",
+                )));
+            }
+        }
 
         // Budget and dispatch share these post-hook messages, schemas and
         // prompt framing. Rebuild after each whole-turn drop without invoking
@@ -2820,25 +2904,28 @@ async fn run_tool_call_loop_impl<'a>(
             streamed_protocol_suppressed,
             streamed_visible_text,
             image_recovery_succeeded,
-        } = call_provider(
-            &ctx,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            provider_dispatch_model,
-            zeroclaw_api::model_provider::ChatRequest {
-                messages: &provider_request_messages,
-                tools: request_tools,
-                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .try_with(Clone::clone)
-                    .ok()
-                    .flatten(),
-            },
-            image_recovery_messages.as_deref(),
-            should_consume_provider_stream,
-            policy,
-            iteration,
-            use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+        } = zeroclaw_providers::reliable::scope_preserve_context_projection(
+            compression.is_some(),
+            Box::pin(call_provider(
+                &ctx,
+                active_model_provider,
+                active_model_provider_name,
+                provider_request_model,
+                provider_dispatch_model,
+                zeroclaw_api::model_provider::ChatRequest {
+                    messages: &provider_request_messages,
+                    tools: request_tools,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
+                image_recovery_messages.as_deref(),
+                should_consume_provider_stream,
+                policy,
+                iteration,
+                use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+            )),
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
@@ -2980,6 +3067,13 @@ async fn run_tool_call_loop_impl<'a>(
                 // complete.
                 emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
+                if compression.is_some()
+                    && zeroclaw_providers::reliable::is_context_window_exceeded(&e)
+                {
+                    return Err(e.context(crate::i18n::get_required_cli_string(
+                        "turn-compaction-floor",
+                    )));
+                }
                 let recovered = try_recover_context_overflow(
                     injected_memory_preamble,
                     turn_state.history,
@@ -3269,7 +3363,9 @@ async fn run_tool_call_loop_impl<'a>(
 
             let msg = ChatMessage::assistant(response_text.clone());
             turn_state.push_dual(msg);
-            if let Some(reported) = reported_input_tokens {
+            if let Some(reported) = reported_input_tokens
+                && compression.is_none()
+            {
                 // Terminal response: no next request will be dispatched, so no
                 // hook reserve is carried — enforcement never executes a
                 // modifying `before_llm_call` hook merely to estimate a request
@@ -3491,6 +3587,15 @@ async fn run_tool_call_loop_impl<'a>(
             knobs.provider_attempt_allowlist.clone(),
             execution,
         );
+        let recall = if executable_calls
+            .iter()
+            .any(|call| call.name == compaction::HistoryRecall::NAME)
+        {
+            compaction_state.recall_scope(turn_state.history)
+        } else {
+            Default::default()
+        };
+        let execution = compaction::RECALL.scope(recall, execution);
         let execution_result = match shared_budget.clone() {
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,
@@ -3807,6 +3912,9 @@ async fn run_tool_call_loop_impl<'a>(
         pending_reported_usage,
         observer,
         turn_vision_source,
+        compression
+            .as_ref()
+            .map(|(config, cache, settings)| (*config, *cache, settings, &mut compaction_state)),
     )
     .await;
     *history_has_trim_breadcrumb = turn_state.crumb_present;

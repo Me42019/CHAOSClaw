@@ -223,6 +223,10 @@ impl SqliteSessionBackend {
                 "principal_id",
                 "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
             ),
+            (
+                "compaction_json",
+                "ALTER TABLE session_metadata ADD COLUMN compaction_json TEXT",
+            ),
         ] {
             Self::ensure_metadata_column(&tx, column, ddl)?;
         }
@@ -326,6 +330,95 @@ impl SqliteSessionBackend {
             params![session_key, now, now],
         )?;
         Ok(())
+    }
+
+    fn replace_session_checkpoint(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+        summaries: Option<&str>,
+    ) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        let known = tx
+            .query_row(
+                "SELECT compaction_json IS NOT NULL, message_count FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, usize>(1)?)),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        let Some((had_compaction, previous_count)) = known else {
+            return Ok(false);
+        };
+        if summaries.is_some() || had_compaction {
+            let prefix = Self::replace_checkpoint_suffix(&tx, session_key, messages)
+                .map_err(std::io::Error::other)?;
+            if let Some(summaries) = summaries {
+                tx.execute(
+                    "UPDATE session_metadata SET compaction_json = ?2 WHERE session_key = ?1",
+                    params![session_key, summaries],
+                )
+                .map_err(std::io::Error::other)?;
+            } else if prefix < previous_count {
+                // If normal retention or an edit removed a source, rebuild
+                // the derived index from the remaining originals next time.
+                tx.execute(
+                    "UPDATE session_metadata SET compaction_json = NULL WHERE session_key = ?1",
+                    params![session_key],
+                )
+                .map_err(std::io::Error::other)?;
+            }
+        } else {
+            Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        }
+        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
+            .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
+    /// Preserve row IDs and timestamps for originals already stored by an
+    /// earlier checkpoint. Only the changed tail needs to be rewritten.
+    fn replace_checkpoint_suffix(
+        conn: &Connection,
+        session_key: &str,
+        messages: &[ChatMessage],
+    ) -> rusqlite::Result<usize> {
+        let mut prefix = 0;
+        let mut last_id = 0_i64;
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, role, content FROM sessions WHERE session_key = ?1 ORDER BY id",
+            )?;
+            let mut rows = stmt.query(params![session_key])?;
+            for message in messages {
+                let Some(row) = rows.next()? else {
+                    break;
+                };
+                if row.get::<_, String>(1)? != message.role
+                    || row.get::<_, String>(2)? != message.content
+                {
+                    break;
+                }
+                last_id = row.get(0)?;
+                prefix += 1;
+            }
+        }
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1 AND id > ?2",
+            params![session_key, last_id],
+        )?;
+        conn.execute(
+            "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
+            params![session_key, prefix],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        for message in &messages[prefix..] {
+            Self::append_on(conn, session_key, message, &now)?;
+        }
+        Ok(prefix)
     }
 
     fn rewrite_messages_on(
@@ -1120,25 +1213,29 @@ impl SessionBackend for SqliteSessionBackend {
         messages: &[ChatMessage],
         breadcrumb_present: bool,
     ) -> std::io::Result<bool> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(std::io::Error::other)?;
-        let exists = tx
-            .query_row(
-                "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
-                params![session_key],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(std::io::Error::other)?
-            .is_some();
-        if !exists {
-            return Ok(false);
-        }
-        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
-        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
-            .map_err(std::io::Error::other)?;
-        tx.commit().map_err(std::io::Error::other)?;
-        Ok(true)
+        self.replace_session_checkpoint(session_key, messages, breadcrumb_present, None)
+    }
+
+    fn load_compaction(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT compaction_json FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(std::io::Error::other)
+    }
+
+    fn checkpoint_compaction(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+        summaries: &str,
+    ) -> std::io::Result<bool> {
+        self.replace_session_checkpoint(session_key, messages, breadcrumb_present, Some(summaries))
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -1318,7 +1415,7 @@ impl SessionBackend for SqliteSessionBackend {
         // and a stale recorded `true` on an already-empty session must not
         // survive to misclassify the next first message.
         conn.execute(
-            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL WHERE session_key = ?2",
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL, compaction_json = NULL WHERE session_key = ?2",
             params![Utc::now().to_rfc3339(), session_key],
         )
         .map_err(std::io::Error::other)?;

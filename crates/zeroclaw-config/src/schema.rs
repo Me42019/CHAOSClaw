@@ -4350,8 +4350,7 @@ pub struct AliasedAgentConfig {
 
     /// Per-agent override for the context-compression summarizer provider, as
     /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
-    /// the runtime profile's `context_compression.summary_provider`, else the
-    /// agent's own resolved provider+model. Reference only, never a copy;
+    /// the runtime profile's `context_compression.summary_provider`. Reference only, never a copy;
     /// resolved by [`Config::effective_summary_provider`]. Validated in
     /// `Config::validate()`.
     #[tab(Providers)]
@@ -4655,11 +4654,8 @@ impl Config {
 
     /// Effective context-compression summarizer provider for an agent:
     /// agent-level `summary_provider` override → the runtime profile's
-    /// `context_compression.summary_provider` → `None` (the caller then reuses
-    /// the agent's own provider and model). Unlike the inert agent-inline
-    /// tunables below, the agent-level override IS consulted — it's an
-    /// explicit per-agent choice, mirroring `classifier_provider`'s
-    /// "empty = inherit" semantics.
+    /// `context_compression.summary_provider` → `None`.
+    /// Compaction requires an explicit dedicated route.
     #[must_use]
     pub fn effective_summary_provider(
         &self,
@@ -24252,25 +24248,7 @@ impl Config {
         }
     }
 
-    /// Surface every non-default `context_compression` knob as inert: the
-    /// runtime context compressor was removed and nothing in the
-    /// workspace reads `context_compression` at runtime anymore, so the whole
-    /// struct — `enabled`, thresholds, protected counts, summarizer limits,
-    /// provider selection, tool-result retrimming — has no effect. Mirrors
-    /// `validate_memory_semantics`: one warning per non-default field, so a
-    /// user sees exactly which of their authored knobs are dead. A field
-    /// explicitly written at its default value is indistinguishable from an
-    /// omitted one post-deserialization and stays silent (same limitation as
-    /// `validate_memory_semantics`).
-    ///
-    /// Only `[runtime_profiles.<alias>.context_compression]` is checked —
-    /// `AliasedAgentConfig` (`[agents.<alias>]`) has no `context_compression`
-    /// field of its own, and the legacy pre-V3 `[agent.context_compression]`
-    /// top-level table (folded into `[runtime_profiles.default]` by the V2→V3
-    /// migration, see `schema/v2.rs`) has already collapsed into this same
-    /// surface by the time `Config` exists, so a single pass over
-    /// `runtime_profiles` covers both the historical and current authored
-    /// forms without double-warning.
+    /// Surface missing summary routes and legacy knobs that still have no effect.
     fn collect_context_compression_ignored_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
@@ -24278,68 +24256,73 @@ impl Config {
         let defaults = crate::scattered_types::ContextCompressionConfig::default();
         for (alias, profile) in &self.runtime_profiles {
             let cc = &profile.context_compression;
-
-            // `enabled = true` gets its own message: it is the master switch
-            // users flip expecting compression to happen at all.
-            if cc.enabled {
+            let summary_configured = !cc.summary_provider.trim().is_empty()
+                || self.agents.values().any(|agent| {
+                    agent.runtime_profile.as_str() == alias
+                        && !agent.summary_provider.trim().is_empty()
+                });
+            if cc.enabled && !summary_configured {
                 warnings.push(crate::validation_warnings::ValidationWarning::new(
                     "context_compression_unsupported",
-                    format!(
-                        "runtime_profiles.{alias}.context_compression.enabled is set but context \
-                         compression is not currently implemented in the runtime (the compressor \
-                         was removed in #8196); this setting has no effect."
-                    ),
+                    "Context compaction requires a dedicated local llamacpp summary_provider.",
                     format!("runtime_profiles.{alias}.context_compression.enabled"),
                 ));
             }
-
-            // Every other knob: flag any value that differs from the default.
-            let mut inert: Vec<&'static str> = Vec::new();
-            if (cc.threshold_ratio - defaults.threshold_ratio).abs() > f64::EPSILON {
-                inert.push("threshold_ratio");
-            }
-            if cc.protect_first_n != defaults.protect_first_n {
-                inert.push("protect_first_n");
-            }
-            if cc.protect_last_n != defaults.protect_last_n {
-                inert.push("protect_last_n");
-            }
-            if cc.max_passes != defaults.max_passes {
-                inert.push("max_passes");
-            }
-            if cc.summary_max_chars != defaults.summary_max_chars {
-                inert.push("summary_max_chars");
-            }
-            if cc.source_max_chars != defaults.source_max_chars {
-                inert.push("source_max_chars");
-            }
-            if cc.timeout_secs != defaults.timeout_secs {
-                inert.push("timeout_secs");
-            }
-            if cc.summary_provider != defaults.summary_provider {
-                inert.push("summary_provider");
-            }
-            if cc.identifier_policy != defaults.identifier_policy {
-                inert.push("identifier_policy");
-            }
-            if cc.tool_result_retrim_chars != defaults.tool_result_retrim_chars {
-                inert.push("tool_result_retrim_chars");
-            }
-            if cc.tool_result_trim_exempt != defaults.tool_result_trim_exempt {
-                inert.push("tool_result_trim_exempt");
-            }
-
-            for field in inert {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "context_compression_unsupported",
-                    format!(
-                        "runtime_profiles.{alias}.context_compression.{field} is set to a \
-                         non-default value but context compression is not currently implemented \
-                         in the runtime (the compressor was removed in #8196); this setting has \
-                         no effect."
-                    ),
-                    format!("runtime_profiles.{alias}.context_compression.{field}"),
-                ));
+            let inert = [
+                (
+                    "threshold_ratio",
+                    !cc.enabled
+                        && (cc.threshold_ratio - defaults.threshold_ratio).abs() > f64::EPSILON,
+                ),
+                (
+                    "protect_first_n",
+                    cc.protect_first_n != defaults.protect_first_n,
+                ),
+                (
+                    "protect_last_n",
+                    !cc.enabled && cc.protect_last_n != defaults.protect_last_n,
+                ),
+                (
+                    "max_passes",
+                    !cc.enabled && cc.max_passes != defaults.max_passes,
+                ),
+                (
+                    "summary_max_chars",
+                    !cc.enabled && cc.summary_max_chars != defaults.summary_max_chars,
+                ),
+                (
+                    "source_max_chars",
+                    !cc.enabled && cc.source_max_chars != defaults.source_max_chars,
+                ),
+                (
+                    "timeout_secs",
+                    !cc.enabled && cc.timeout_secs != defaults.timeout_secs,
+                ),
+                (
+                    "summary_provider",
+                    !cc.enabled && cc.summary_provider != defaults.summary_provider,
+                ),
+                (
+                    "identifier_policy",
+                    cc.identifier_policy != defaults.identifier_policy,
+                ),
+                (
+                    "tool_result_retrim_chars",
+                    cc.tool_result_retrim_chars != defaults.tool_result_retrim_chars,
+                ),
+                (
+                    "tool_result_trim_exempt",
+                    cc.tool_result_trim_exempt != defaults.tool_result_trim_exempt,
+                ),
+            ];
+            for (field, ignored) in inert {
+                if ignored {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        "context_compression_unsupported",
+                        format!("The non-default value for {field} has no effect with the current context compaction settings."),
+                        format!("runtime_profiles.{alias}.context_compression.{field}"),
+                    ));
+                }
             }
         }
     }
@@ -52837,10 +52820,7 @@ allowed_users = []
         assert_eq!(cfg.effective_summary_provider("c"), None);
     }
 
-    // The runtime context compressor was removed; nothing reads
-    // `context_compression` at runtime anymore, so an explicit
-    // `enabled = true` on a named runtime profile is inert and must be
-    // flagged.
+    // Enabling compaction without a dedicated summary provider is diagnosed.
     #[tokio::test]
     async fn collect_warnings_flags_context_compression_enabled_on_runtime_profile() {
         let toml = r#"
@@ -52863,8 +52843,9 @@ allowed_users = []
             .expect("expected context_compression_unsupported warning");
         assert_eq!(w.path, "runtime_profiles.fast.context_compression.enabled");
         assert!(
-            w.message.contains("not currently implemented"),
-            "message explains the flag is inert: {}",
+            w.message
+                .contains("dedicated local llamacpp summary_provider"),
+            "message explains the missing summarizer: {}",
             w.message
         );
     }
@@ -52894,9 +52875,7 @@ allowed_users = []
         );
     }
 
-    // A default config (no explicit `context_compression.enabled`) must stay
-    // silent — the flag now defaults to `false`, matching the runtime, which
-    // does not consult it at all.
+    // The default disabled profile needs no compaction warning.
     #[tokio::test]
     async fn collect_warnings_silent_for_context_compression_default() {
         let toml = r#"
@@ -52917,10 +52896,7 @@ allowed_users = []
         );
     }
 
-    // Every `context_compression` knob is inert, not just `enabled` — tuning
-    // fields set to non-default values must each surface their own warning
-    // with a per-field path, even with `enabled` left off, since the whole
-    // struct is covered.
+    // Report non-default fields that are ignored on a disabled profile.
     #[tokio::test]
     async fn collect_warnings_flags_context_compression_tuning_fields() {
         let toml = r#"
