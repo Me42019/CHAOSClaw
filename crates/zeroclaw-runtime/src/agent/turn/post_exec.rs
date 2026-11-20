@@ -32,6 +32,7 @@ pub(crate) async fn record_executed_outcomes(
         // batches interleave call->result per tool. Post-exec only records the
         // outcome to history, logs, hooks, and ordered_results.
 
+        let artifact_read = crate::tools::tool_output_read::ToolOutputRead::matches(&call.name);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
@@ -47,7 +48,7 @@ pub(crate) async fn record_executed_outcomes(
                     "iteration": iteration + 1,
                     "tool": call.name.clone(),
                     "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
-                    "output": scrub_credentials(&outcome.output),
+                    "output": (!artifact_read).then(|| scrub_credentials(&outcome.output)),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_result"
@@ -58,7 +59,11 @@ pub(crate) async fn record_executed_outcomes(
             let hook_context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *idx);
             let tool_result_obj = crate::tools::ToolResult {
                 success: outcome.success,
-                output: outcome.output.clone().into(),
+                output: if artifact_read {
+                    "".into()
+                } else {
+                    outcome.output.clone().into()
+                },
                 error: None,
             };
             // The prepared arguments travel with the completion call so

@@ -57,6 +57,8 @@ pub enum ToolTier {
 pub enum BuiltinToolCompilation {
     /// The implementation is not behind an opt-in tool feature.
     Always,
+    /// Host implementation available on Unix.
+    Unix,
     /// Native adapters compiled by `tools-external`.
     External,
     /// An existing SaaS or coding-CLI compilation group.
@@ -68,6 +70,7 @@ impl BuiltinToolCompilation {
     pub const fn compiled(self) -> bool {
         match self {
             Self::Always => true,
+            Self::Unix => cfg!(unix),
             Self::External => cfg!(feature = "tools-external"),
             Self::OptIn(tool) => {
                 // A consumer can enable config features without compiling the concrete owner.
@@ -303,6 +306,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         name: "sessions_send",
         tier: ToolTier::Host,
         compilation: BuiltinToolCompilation::Always,
+    },
+    BuiltinToolSpec {
+        name: "tool_output_read",
+        tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Unix,
     },
     // SOP.
     BuiltinToolSpec {

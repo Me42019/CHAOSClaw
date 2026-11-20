@@ -414,6 +414,10 @@ async fn execute_one_tool_with_provenance(
         }
     };
     let tool = resolved.tool();
+    // Artifact pages can contain exactly the sensitive bytes that the archive
+    // keeps out of logs. Keep their payload out of diagnostic sinks even when
+    // ordinary tool I/O logging is enabled.
+    let artifact_read = crate::tools::tool_output_read::ToolOutputRead::matches(tool.name());
 
     use ::zeroclaw_log::Instrument;
     let tool_span = ::zeroclaw_log::info_span!(
@@ -492,7 +496,7 @@ async fn execute_one_tool_with_provenance(
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
                             "input": call_arguments,
-                            "output": r.output,
+                            "output": (!artifact_read).then_some(&r.output),
                         })),
                         format!("tool result: {call_name}")
                     );
@@ -507,8 +511,8 @@ async fn execute_one_tool_with_provenance(
                                 "tool": call_name,
                                 "tool_call_id": tool_call_id,
                                 "input": call_arguments,
-                                "error": r.error.clone().unwrap_or_default(),
-                                "output": r.output,
+                                "error": (!artifact_read).then(|| r.error.as_deref().unwrap_or_default()),
+                                "output": (!artifact_read).then_some(&r.output),
                             })),
                         format!("tool failed: {call_name}")
                     );
@@ -528,7 +532,7 @@ async fn execute_one_tool_with_provenance(
                         duration,
                         success: true,
                         arguments: Some(full_args.clone()),
-                        result: Some(scrub_credentials(normalized_output)),
+                        result: (!artifact_read).then(|| scrub_credentials(normalized_output)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -579,7 +583,7 @@ async fn execute_one_tool_with_provenance(
                         duration,
                         success: false,
                         arguments: Some(full_args.clone()),
-                        result: Some(model_visible.clone()),
+                        result: (!artifact_read).then(|| model_visible.clone()),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -608,7 +612,7 @@ async fn execute_one_tool_with_provenance(
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
                             "input": call_arguments,
-                            "error": format!("{e:?}"),
+                            "error": (!artifact_read).then(|| format!("{e:?}")),
                         })),
                     format!("tool error: {call_name}")
                 );
@@ -625,7 +629,7 @@ async fn execute_one_tool_with_provenance(
                     duration,
                     success: false,
                     arguments: Some(full_args.clone()),
-                    result: Some(model_visible.clone()),
+                    result: (!artifact_read).then(|| model_visible.clone()),
                     channel: Some(meta.channel_name.to_string()),
                     agent_alias: meta.agent_alias.map(|s| s.to_string()),
                     parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -2411,7 +2415,9 @@ mod tests {
             "test-model",
             0,
             "turn-test",
+            None,
         )
+        .await
         .expect("collect_tool_results must succeed");
 
         assert!(
